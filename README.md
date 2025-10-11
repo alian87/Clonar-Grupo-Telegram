@@ -137,3 +137,12 @@ Iniciando cópia…
 
 Deseja copiar outro grupo? (s/n): s```
 
+## 🙏 Créditos e agradecimentos
+
+Este projeto utiliza a biblioteca [**Telethon**](https://github.com/LonamiWebs/Telethon),  
+um cliente Python open-source para a API do Telegram, licenciado sob a **MIT License**.
+
+Agradecimentos especiais à comunidade Telethon por tornar possível o uso da API de forma estável e acessível.
+
+> Telethon © 2015–2025 Lonami Exo — Licensed under the MIT License  
+> [https://github.com/LonamiWebs/Telethon](https://github.com/LonamiWebs/Telethon)
