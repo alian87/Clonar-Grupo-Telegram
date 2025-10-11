@@ -135,7 +135,8 @@ Iniciando cópia…
 200 mensagens encaminhadas…
 ✅ Encaminhamento concluído. Total: 356
 
-Deseja copiar outro grupo? (s/n): s```
+Deseja copiar outro grupo? (s/n): s
+```
 
 ## 🙏 Créditos e agradecimentos
 
