@@ -2,19 +2,21 @@ import argparse
 import asyncio
 import json
 import random
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 
 from telethon import TelegramClient, functions, types, utils
-from telethon.errors import FloodWaitError, ChatAdminRequiredError
+from telethon.errors import FloodWaitError, ChatAdminRequiredError, RPCError
 
 # ====== CONFIGURAÇÕES PADRÃO ======
 CONFIG_FILE = Path(__file__).with_name("cpgrupo_config.json")
 SYNC_FILE = Path(__file__).with_name("cpgrupo_sync.json")
 SESSION_NAME = "session_forward"
 LIST_LIMIT = 200
-BATCH_SIZE = 50
-SLEEP_BETWEEN = 0.2
+BATCH_SIZE = 20
+SLEEP_BETWEEN = 1.5
+PAUSA_ENTRE_TOPICOS = 5
 # ===================================
 
 
@@ -619,6 +621,41 @@ async def encaminhar_lote(client, from_entity, to_entity, ids_buffer, top_msg_id
     await client(functions.messages.ForwardMessagesRequest(**kwargs))
 
 
+def _segundos_flood(exc) -> int:
+    seconds = getattr(exc, "seconds", None)
+    if seconds:
+        return int(seconds)
+    match = re.search(r"wait of (\d+) seconds", str(exc), re.IGNORECASE)
+    if match:
+        return int(match.group(1))
+    return 60
+
+
+async def aguardar_flood(exc):
+    seconds = _segundos_flood(exc)
+    minutos = seconds // 60
+    resto = seconds % 60
+    if minutos:
+        print(f"  ⏳ FloodWait: aguardando {seconds}s (~{minutos} min {resto}s)…")
+    else:
+        print(f"  ⏳ FloodWait: aguardando {seconds}s…")
+    await asyncio.sleep(seconds + 1)
+
+
+async def encaminhar_com_retry(client, from_entity, to_entity, ids_buffer, top_msg_id):
+    while True:
+        try:
+            await encaminhar_lote(client, from_entity, to_entity, ids_buffer, top_msg_id)
+            return
+        except FloodWaitError as exc:
+            await aguardar_flood(exc)
+        except RPCError as exc:
+            if "wait" in str(exc).lower() and "seconds" in str(exc).lower():
+                await aguardar_flood(exc)
+            else:
+                raise
+
+
 async def copiar_mensagens_topico(
     client,
     from_entity,
@@ -640,6 +677,18 @@ async def copiar_mensagens_topico(
     else:
         message_iter = client.iter_messages(from_entity, reverse=True)
 
+    async def enviar_buffer():
+        nonlocal total, max_copied_id, ids_buffer
+        if not ids_buffer:
+            return
+        lote = ids_buffer[:]
+        await encaminhar_com_retry(client, from_entity, to_entity, lote, dest_top_id)
+        total += len(lote)
+        max_copied_id = max(max_copied_id, max(lote))
+        print(f"  {total} mensagens encaminhadas…")
+        ids_buffer.clear()
+        await asyncio.sleep(SLEEP_BETWEEN)
+
     async for msg in message_iter:
         if isinstance(msg, types.MessageService):
             continue
@@ -650,36 +699,38 @@ async def copiar_mensagens_topico(
             continue
 
         ids_buffer.append(msg.id)
-        max_copied_id = max(max_copied_id, msg.id)
         if len(ids_buffer) < BATCH_SIZE:
             continue
 
         try:
-            await encaminhar_lote(client, from_entity, to_entity, ids_buffer, dest_top_id)
-            total += len(ids_buffer)
-            print(f"  {total} mensagens encaminhadas…")
-            ids_buffer.clear()
-            await asyncio.sleep(SLEEP_BETWEEN)
-        except FloodWaitError as e:
-            print(f"  FloodWait: aguardando {e.seconds}s")
-            await asyncio.sleep(e.seconds + 1)
+            await enviar_buffer()
         except Exception as e:
             print(f"  Erro em lote -> {e}")
-            for mid in ids_buffer:
+            for mid in ids_buffer[:]:
                 try:
-                    await encaminhar_lote(client, from_entity, to_entity, [mid], dest_top_id)
+                    await encaminhar_com_retry(
+                        client, from_entity, to_entity, [mid], dest_top_id
+                    )
                     total += 1
+                    max_copied_id = max(max_copied_id, mid)
                 except Exception as e2:
                     print(f"  Erro id {mid} -> {e2}")
             ids_buffer.clear()
 
     if ids_buffer:
         try:
-            await encaminhar_lote(client, from_entity, to_entity, ids_buffer, dest_top_id)
-            total += len(ids_buffer)
-            print(f"  {total} mensagens encaminhadas…")
+            await enviar_buffer()
         except Exception as e:
             print(f"  Erro no envio final -> {e}")
+            for mid in ids_buffer[:]:
+                try:
+                    await encaminhar_com_retry(
+                        client, from_entity, to_entity, [mid], dest_top_id
+                    )
+                    total += 1
+                    max_copied_id = max(max_copied_id, mid)
+                except Exception as e2:
+                    print(f"  Erro id {mid} -> {e2}")
 
     return total, max_copied_id
 
@@ -768,6 +819,9 @@ async def copiar_comunidade_forum(client, from_entity, to_entity, incremental=Fa
                 print(f"  ✅ Tópico concluído: {total} mensagem(ns)")
         except Exception as e:
             print(f"  ❌ Erro ao copiar tópico: {e}")
+
+        if index < len(topics):
+            await asyncio.sleep(PAUSA_ENTRE_TOPICOS)
 
     print(f"\n✅ Comunidade sincronizada. Total geral: {grand_total} mensagem(ns)\n")
 

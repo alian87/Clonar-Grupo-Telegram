@@ -278,11 +278,28 @@ python CopiarGrupo.py --reset-sync
 1. Use somente em grupos nos quais você participa e tem permissão.
 2. Respeite os Termos de Uso do Telegram.
 3. O script usa a User API (sua conta), não Bot API.
-4. Grupos muito grandes podem gerar `FloodWait` — o script aguarda automaticamente.
+4. Grupos muito grandes podem gerar `FloodWait` — o script **aguarda automaticamente** e continua (pode levar dezenas de minutos).
 5. Tópicos fechados na origem só serão copiados se sua conta tiver acesso a eles.
 6. Ícones personalizados (emoji premium) podem não ser replicados sem Telegram Premium.
 7. No modo incremental, use sempre o **mesmo par** origem → destino para o histórico funcionar.
 8. Arquivos locais sensíveis: `cpgrupo_config.json`, `session_forward.session` e `cpgrupo_sync.json`.
+
+### ⏳ FloodWait (limite do Telegram)
+
+O Telegram limita quantas mensagens podem ser encaminhadas por hora. Quando isso acontece, aparece:
+
+```
+⏳ FloodWait: aguardando 2471s (~41 min 11s)…
+```
+
+**Isso é normal** em cópias grandes — não é bloqueio permanente. O script aguarda e **continua sozinho**.
+
+**O que fazer:**
+- Deixe o terminal aberto e aguarde
+- Não interrompa no meio do FloodWait
+- Se parou com tópicos em 0 mensagens, rode de novo com **(i) Incremental** — só copia o que faltou
+
+Para reduzir FloodWait, o script usa lotes menores (20 mensagens) e pausa entre tópicos. Mesmo assim, grupos com milhares de mensagens podem levar **horas**.
 
 ## 🧠 Exemplo: primeira cópia (completa)
 
