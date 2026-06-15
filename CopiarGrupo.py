@@ -2,6 +2,7 @@ import argparse
 import asyncio
 import json
 import random
+from datetime import datetime, timezone
 from pathlib import Path
 
 from telethon import TelegramClient, functions, types, utils
@@ -9,6 +10,7 @@ from telethon.errors import FloodWaitError, ChatAdminRequiredError
 
 # ====== CONFIGURAÇÕES PADRÃO ======
 CONFIG_FILE = Path(__file__).with_name("cpgrupo_config.json")
+SYNC_FILE = Path(__file__).with_name("cpgrupo_sync.json")
 SESSION_NAME = "session_forward"
 LIST_LIMIT = 200
 BATCH_SIZE = 50
@@ -26,6 +28,55 @@ def load_config():
 def save_config(cfg: dict):
     with open(CONFIG_FILE, "w", encoding="utf-8") as f:
         json.dump(cfg, f, ensure_ascii=False, indent=2)
+
+
+def load_sync():
+    if SYNC_FILE.exists():
+        with open(SYNC_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return {"pairs": {}}
+
+
+def save_sync(sync_data: dict):
+    with open(SYNC_FILE, "w", encoding="utf-8") as f:
+        json.dump(sync_data, f, ensure_ascii=False, indent=2)
+
+
+def sync_pair_key(from_entity, to_entity) -> str:
+    return f"{utils.get_peer_id(from_entity)}:{utils.get_peer_id(to_entity)}"
+
+
+def topic_sync_key(topic) -> str:
+    return (getattr(topic, "title", None) or "Geral").strip()
+
+
+def solicitar_modo_incremental(sync_data, pair_key: str) -> bool:
+    pair = sync_data.get("pairs", {}).get(pair_key)
+    if pair:
+        atualizado = pair.get("updated_at", "data desconhecida")
+        print(f"\n🔄 Cópia anterior detectada para este par de grupos ({atualizado}).")
+        resposta = input("Copiar apenas conteúdo NOVO? (s/n) [s]: ").strip().lower()
+        return resposta in ("", "s")
+
+    print("\n📥 Primeira cópia deste par — todo o conteúdo será copiado.")
+    print("   Nas próximas vezes você poderá sincronizar só o que for novo.")
+    return False
+
+
+def obter_ultimo_id_topico(sync_data, pair_key: str, titulo_topico: str) -> int:
+    pair = sync_data.get("pairs", {}).get(pair_key, {})
+    topico = pair.get("topics", {}).get(titulo_topico, {})
+    return int(topico.get("last_msg_id", 0))
+
+
+def registrar_topico_sync(sync_data, pair_key: str, titulo_topico: str, source_topic_id: int, last_msg_id: int):
+    pairs = sync_data.setdefault("pairs", {})
+    pair = pairs.setdefault(pair_key, {"topics": {}})
+    pair["topics"][titulo_topico] = {
+        "last_msg_id": last_msg_id,
+        "source_topic_id": source_topic_id,
+    }
+    pair["updated_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
 
 def first_time_setup(existing_cfg=None):
@@ -432,8 +483,10 @@ async def copiar_mensagens_topico(
     source_topic_id,
     dest_top_id,
     other_topic_ids=None,
+    min_msg_id=0,
 ):
     total = 0
+    max_copied_id = min_msg_id
     ids_buffer = []
     other_topic_ids = other_topic_ids or set()
 
@@ -448,7 +501,11 @@ async def copiar_mensagens_topico(
         if source_topic_id is not None:
             if not _mensagem_no_topico(msg, source_topic_id, other_topic_ids):
                 continue
+        if msg.id <= min_msg_id:
+            continue
+
         ids_buffer.append(msg.id)
+        max_copied_id = max(max_copied_id, msg.id)
         if len(ids_buffer) < BATCH_SIZE:
             continue
 
@@ -479,22 +536,29 @@ async def copiar_mensagens_topico(
         except Exception as e:
             print(f"  Erro no envio final -> {e}")
 
-    return total
+    return total, max_copied_id
 
 
-async def copiar_comunidade_forum(client, from_entity, to_entity):
+async def copiar_comunidade_forum(client, from_entity, to_entity, incremental=False, sync_data=None):
+    sync_data = sync_data if sync_data is not None else load_sync()
+    pair_key = sync_pair_key(from_entity, to_entity)
     to_entity = await ensure_forum_enabled(client, to_entity)
     topics = await listar_topicos(client, from_entity)
 
     if not topics:
         print("⚠️ Nenhum tópico encontrado na origem. Copiando mensagens no tópico Geral…")
-        dest_topics = await listar_topicos(client, to_entity)
-        dest_general = next((t for t in dest_topics if t.id == 1), None)
-        if dest_general is None:
-            raise RuntimeError("Tópico Geral não encontrado no destino.")
-        total = await copiar_mensagens_topico(
-            client, from_entity, to_entity, 1, None, set()
+        titulo = "Geral"
+        min_id = obter_ultimo_id_topico(sync_data, pair_key, titulo) if incremental else 0
+        if incremental and min_id:
+            print(f"  Última mensagem copiada: id {min_id}")
+        total, max_id = await copiar_mensagens_topico(
+            client, from_entity, to_entity, 1, None, set(), min_msg_id=min_id
         )
+        if incremental:
+            registrar_topico_sync(sync_data, pair_key, titulo, 1, max_id)
+            save_sync(sync_data)
+        if total == 0 and incremental:
+            print("  Nenhuma mensagem nova.")
         print(f"\n✅ Cópia concluída. Total: {total} mensagem(ns)\n")
         return
 
@@ -503,11 +567,18 @@ async def copiar_comunidade_forum(client, from_entity, to_entity):
     other_topic_ids = {t.id for t in topics if t.id != 1}
 
     print(f"\n📋 {len(topics)} tópico(s) encontrado(s) na origem.")
+    if incremental:
+        print("🔄 Modo incremental: copiando apenas mensagens novas por tópico.")
     grand_total = 0
 
     for index, topic in enumerate(topics, 1):
         title = topic.title or "Geral"
+        titulo_sync = topic_sync_key(topic)
         print(f"\n[{index}/{len(topics)}] Tópico: {title!r}")
+
+        min_id = obter_ultimo_id_topico(sync_data, pair_key, titulo_sync) if incremental else 0
+        if incremental and min_id:
+            print(f"  Última mensagem copiada: id {min_id}")
 
         try:
             dest_top_id = await preparar_topico_destino(
@@ -523,20 +594,26 @@ async def copiar_comunidade_forum(client, from_entity, to_entity):
 
         print("  Iniciando cópia…")
         try:
-            total = await copiar_mensagens_topico(
+            total, max_id = await copiar_mensagens_topico(
                 client,
                 from_entity,
                 to_entity,
                 topic.id,
                 dest_top_id,
                 other_topic_ids,
+                min_msg_id=min_id,
             )
+            registrar_topico_sync(sync_data, pair_key, titulo_sync, topic.id, max_id)
+            save_sync(sync_data)
             grand_total += total
-            print(f"  ✅ Tópico concluído: {total} mensagem(ns)")
+            if total == 0 and incremental:
+                print("  Nenhuma mensagem nova.")
+            else:
+                print(f"  ✅ Tópico concluído: {total} mensagem(ns)")
         except Exception as e:
             print(f"  ❌ Erro ao copiar tópico: {e}")
 
-    print(f"\n✅ Comunidade clonada. Total geral: {grand_total} mensagem(ns)\n")
+    print(f"\n✅ Comunidade sincronizada. Total geral: {grand_total} mensagem(ns)\n")
 
 
 async def get_or_create_topic(client, channel, title: str) -> int:
@@ -546,11 +623,16 @@ async def get_or_create_topic(client, channel, title: str) -> int:
     return await criar_topico(client, channel, title)
 
 
-async def copiar_grupo_simples(client, from_entity, to_entity):
+async def copiar_grupo_simples(
+    client, from_entity, to_entity, incremental=False, sync_data=None
+):
+    sync_data = sync_data if sync_data is not None else load_sync()
+    pair_key = sync_pair_key(from_entity, to_entity)
     origem_title = getattr(from_entity, "title", None) or getattr(
         from_entity, "first_name", "Origem"
     )
     topic_title = origem_title[:128]
+    titulo_sync = topic_title
     print(f"Tópico no destino: {topic_title!r}")
 
     try:
@@ -561,20 +643,34 @@ async def copiar_grupo_simples(client, from_entity, to_entity):
         print("⚠️ Sem permissão para criar tópicos no destino. Encaminhando SEM tópico.")
         top_msg_id = None
 
+    min_id = obter_ultimo_id_topico(sync_data, pair_key, titulo_sync) if incremental else 0
+    if incremental and min_id:
+        print(f"Última mensagem copiada: id {min_id}")
+        print("🔄 Modo incremental: copiando apenas mensagens novas.")
+
     print("Iniciando cópia…")
-    total = await copiar_mensagens_topico(
-        client, from_entity, to_entity, None, top_msg_id
+    total, max_id = await copiar_mensagens_topico(
+        client, from_entity, to_entity, None, top_msg_id, min_msg_id=min_id
     )
+    registrar_topico_sync(sync_data, pair_key, titulo_sync, 0, max_id)
+    save_sync(sync_data)
+    if total == 0 and incremental:
+        print("Nenhuma mensagem nova.")
     print(f"✅ Encaminhamento concluído. Total: {total}\n")
 
 
-async def copiar_origem(client, from_entity, to_entity):
+async def copiar_origem(client, from_entity, to_entity, incremental=False):
+    sync_data = load_sync()
     if await is_forum(client, from_entity):
         print("📂 Origem detectada como comunidade com tópicos.")
-        await copiar_comunidade_forum(client, from_entity, to_entity)
+        await copiar_comunidade_forum(
+            client, from_entity, to_entity, incremental=incremental, sync_data=sync_data
+        )
     else:
         print("💬 Origem detectada como grupo/chat simples.")
-        await copiar_grupo_simples(client, from_entity, to_entity)
+        await copiar_grupo_simples(
+            client, from_entity, to_entity, incremental=incremental, sync_data=sync_data
+        )
 
 
 async def main(reset=False):
@@ -597,7 +693,10 @@ async def main(reset=False):
                     grupos=grupos,
                 )
                 to_entity = await resolver_destino_interativo(client, cfg, from_entity, grupos)
-                await copiar_origem(client, from_entity, to_entity)
+                sync_data = load_sync()
+                pair_key = sync_pair_key(from_entity, to_entity)
+                incremental = solicitar_modo_incremental(sync_data, pair_key)
+                await copiar_origem(client, from_entity, to_entity, incremental=incremental)
             except Exception as e:
                 print(f"❌ Erro ao copiar: {e}")
 

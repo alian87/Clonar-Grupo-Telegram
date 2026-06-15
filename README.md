@@ -16,6 +16,7 @@ Também é possível copiar grupos simples (sem tópicos) para um único tópico
 - Encaminhamento em **lotes** (reduz risco de `FloodWait`).
 - **Armazena credenciais** (`api_id`, `api_hash`) no arquivo `cpgrupo_config.json`.
 - **Lista seus grupos com ID** — exibe todos os grupos da conta para facilitar a seleção.
+- **Sincronização incremental** — na 2ª execução, copia só mensagens novas por tópico.
 - Permite copiar **vários grupos em sequência** sem reiniciar o script.
 
 ----
@@ -78,6 +79,19 @@ Esses dados serão salvos em `cpgrupo_config.json`.
    - **Sem tópicos** → copia tudo para um único tópico com o nome do grupo.
 
 Ao final, pergunta se deseja copiar outro grupo.
+
+### 🔄 Sincronizar só conteúdo novo
+
+Na **segunda cópia** do mesmo par origem → destino, o script detecta a cópia anterior e pergunta:
+
+```
+Copiar apenas conteúdo NOVO? (s/n) [s]:
+```
+
+- **s** (padrão) → copia só mensagens que ainda não foram encaminhadas, tópico por tópico.
+- **n** → recopia tudo do zero (útil se algo deu errado).
+
+O progresso fica salvo em `cpgrupo_sync.json` (local, não commitar).
 
 ### 🔄 Reconfiguração
 

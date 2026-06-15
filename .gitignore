@@ -2,6 +2,7 @@
 cpgrupo_config.json
 session_forward.session
 session_forward.session-journal
+cpgrupo_sync.json
 
 # Python
 __pycache__/
