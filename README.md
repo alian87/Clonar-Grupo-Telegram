@@ -1,149 +1,153 @@
 # 📦 Telegram Grupo Cloner (com suporte a tópicos)
 
-Script em **Python + Telethon** para **copiar automaticamente todo o conteúdo de um grupo do Telegram para outro**, criando **um novo tópico** no grupo de destino com o **mesmo nome do grupo de origem**.
+Script em **Python + Telethon** para **clonar automaticamente comunidades do Telegram com tópicos**, copiando cada tópico da origem para um tópico correspondente no destino — com o mesmo nome, ícone e estado (aberto/fechado).
 
-O objetivo é facilitar **backups, migração ou arquivamento de grupos**, preservando a ordem das mensagens, textos e mídias — tudo dentro de um tópico próprio no destino.
+Também é possível copiar grupos simples (sem tópicos) para um único tópico no destino.
 
 -------------
 
 ### 🚀 Recursos
 
-- Copia **mensagens, mídias e documentos** de qualquer grupo para outro.  
-- Cria **um novo tópico** no grupo de destino com o nome do grupo de origem.  
-- **Oculta os autores originais** (`drop_author=True`), tornando o conteúdo anônimo.  
-- Suporte a **supergrupos com tópicos habilitados**.  
-- Encaminhamento em **lotes** (reduz risco de `FloodWait`).  
-- **Armazena credenciais** (`api_id`, `api_hash`, `destino_id`) no arquivo `cpgrupo_config.json`, pedindo apenas na primeira execução.  
+- **Clona comunidades inteiras com tópicos** — cada tópico da origem vira um tópico no destino.
+- **Cria o supergrupo de destino automaticamente** — não precisa criar o grupo manualmente.
+- Copia **mensagens, mídias e documentos** preservando a ordem cronológica.
+- Preserva **nome, ícone e estado fechado** dos tópicos (quando permitido pela API).
+- **Oculta os autores originais** (`drop_author=True`).
+- Encaminhamento em **lotes** (reduz risco de `FloodWait`).
+- **Armazena credenciais** (`api_id`, `api_hash`) no arquivo `cpgrupo_config.json`.
+- **Lista seus grupos com ID** — exibe todos os grupos da conta para facilitar a seleção.
 - Permite copiar **vários grupos em sequência** sem reiniciar o script.
 
 ----
 
 ### ⚙️ Requisitos
 
-- **Python 3.14 ou superior**  
-- Conta Telegram válida (com número verificado)  
+- **Python 3.10 ou superior**
+- Conta Telegram válida (com número verificado)
 - Biblioteca **Telethon**
+- Permissão de leitura na comunidade de origem
+- Permissão de administrador no destino (ou crie um grupo novo — você será admin automaticamente)
 
 ----
 
 ### 🧩 Configuração inicial
 
-1. Instale o python
+1. Instale o Python.
 
-2. Instale o Telethon via `pip`:
+2. Instale as dependências:
 
 	```bash
-	python -m pip install telethon
+	python -m pip install -r requirements.txt
 	```
-3.  Crie sua API em  [https://my.telegram.org](https://my.telegram.org) → *API Development Tools*
 
-4. Crie um Grupo no Telegram e Habilite **Tópicos**
+3. Crie sua API em [https://my.telegram.org](https://my.telegram.org) → *API Development Tools*
 
 ## ▶️ Execução
 
-### **Para rodar o script:**
-1. Abra o CMD e vá até a pasta onde salvou o arquivo: Exemplo: 
+1. Abra o terminal na pasta do projeto:
 
 ```bash
-	cd C:\Users\seuusuario\Documentos\Clonar-Grupo-Telegram
+cd C:\Users\seuusuario\Documentos\Clonar-Grupo-Telegram
 ```
 
-2. Rode o script: 
+2. Rode o script:
+
 ```bash
-	python CopiarGrupo.py
+python CopiarGrupo.py
 ```
 
 ### Na **primeira execução**, o script solicitará:
 
-1. **API ID** – obtido em [https://my.telegram.org](https://my.telegram.org) → *API Development Tools*  
-2. **API HASH** – exibido junto do seu API ID (o valor é visível no terminal).  
-3. **ID do grupo de destino** – no formato `-100xxxxxxxxxx` (precisa ser um **supergrupo com tópicos ativados**).
+1. **API ID** — obtido em [https://my.telegram.org](https://my.telegram.org)
+2. **API HASH** — exibido junto do seu API ID
 
-Esses dados serão salvos automaticamente no arquivo `cpgrupo_config.json`, como no exemplo:
+Esses dados serão salvos em `cpgrupo_config.json`.
 
-```json
-  "api_id": 12345678,
-  "api_hash": "abcdef1234567890abcdef1234567890",
-  "destino_id": -1009876543210
-```
+> ⚠️ Mantenha este arquivo privado! Ele contém credenciais da API do Telegram.
 
+### Em cada cópia, o script:
 
->⚠️ Mantenha este arquivo privado!
->
->Ele contém suas credenciais de acesso à API do Telegram, associadas à sua conta.
+1. **Exibe todos os seus grupos** com número, ID (`-100...`) e tipo (Grupo ou Fórum).
+2. Pede a **origem** — use o número da lista, o ID, @username ou nome exato. Digite `listar` para ver a lista novamente.
+3. Pede o **destino** — se deseja **criar um novo supergrupo** com tópicos:
+   - **s** → informa o nome (sugestão: `Nome Original (Cópia)`) e o script cria o grupo automaticamente.
+   - **n** → seleciona um grupo existente da lista (com tópicos habilitados).
 
+4. Detecta se a origem é uma **comunidade com tópicos**:
+   - **Com tópicos** → clona cada tópico separadamente (`# BATE PAPO`, `NOVIDADE`, etc.).
+   - **Sem tópicos** → copia tudo para um único tópico com o nome do grupo.
 
-### Nas **próximas execuções** 
-
-1. O script se conecta à sua conta do Telegram usando a sessão salva (session_forward.session).
-2. Pergunta o ID ou Nome Exato do grupo de origem (exemplo: -1001122334455 ou Grupo a ser copiado).
-3. Cria automaticamente um tópico no grupo de destino com o mesmo nome do grupo de origem.
-4. Copia todas as mensagens em ordem cronológica para dentro desse tópico, ocultando o autor original.
-
-Ao final, pergunta:
-```bash
-copiar outro grupo? (s/n)
-```
-> s → permite copiar outro grupo.
-> 
-> n → encerra o programa.
+Ao final, pergunta se deseja copiar outro grupo.
 
 ### 🔄 Reconfiguração
-Para refazer a configuração (alterar o grupo de destino ou suas credenciais da API):
 
 ```bash
 python CopiarGrupo.py --reset
 ```
 
-Isso apaga o arquivo `cpgrupo_config.json`e solicita novamente os dados.
+Isso apaga `cpgrupo_config.json` e solicita novamente API ID e API HASH.
 
 ## 🧱 Estrutura de arquivos
 
-📂 Clonar-Grupo-Telegram
-
 | Arquivo | Função |
 |----------|--------|
-| **`CopiarGrupo.py`** | Script principal que executa a cópia de mensagens e cria os tópicos no grupo destino. |
-| **`cpgrupo_config.json`** | Armazena o `api_id`, `api_hash` e `destino_id`, evitando que sejam digitados novamente. |
-| **`session_forward.session`** | Sessão persistente da sua conta no Telegram (criada automaticamente pelo Telethon). |
-| **`README.md`** | Documento de instruções, instalação e uso do projeto. |
+| **`CopiarGrupo.py`** | Script principal de clonagem. |
+| **`requirements.txt`** | Dependências Python (Telethon). |
+| **`cpgrupo_config.json`** | Armazena `api_id` e `api_hash` (gerado localmente). |
+| **`session_forward.session`** | Sessão da sua conta no Telegram (gerado localmente). |
+| **`README.md`** | Instruções de uso. |
 
-> ⚠️ **Importante:** mantenha os arquivos `cpgrupo_config.json` e `session_forward.session` em local seguro.
-> 
-> Pois ambos contêm informações de autenticação da sua conta do Telegram.
-
-----
 ## ⚠️ Avisos e boas práticas
 
-1. Use somente em grupos nos quais você participa.
-2. Respeite os Termos de Uso do Telegram — evite automatizar spam ou cópia de conteúdos sem permissão.
-3. O script utiliza a User API, não a Bot API, ou seja: age como a sua própria conta.
-4. Evite copiar grupos muito grandes de uma vez; o Telegram pode impor FloodWait se o envio for muito rápido.
-5. O destino precisa ser um supergrupo com tópicos ativados (Configurações → Recursos → Ativar Tópicos).
-6. Caso o destino não permita criar tópicos, as mensagens serão enviadas no feed principal.
+1. Use somente em grupos nos quais você participa e tem permissão.
+2. Respeite os Termos de Uso do Telegram.
+3. O script usa a User API (sua conta), não Bot API.
+4. Grupos muito grandes podem gerar `FloodWait` — o script aguarda automaticamente.
+5. Tópicos fechados na origem só serão copiados se sua conta tiver acesso a eles.
+6. Ícones personalizados (emoji premium) podem não ser replicados sem Telegram Premium.
 
 ## 🧠 Exemplo de uso
 
 ```bash
-C:\Users\User\Documentos\ python CopiarGrupo.py
-Conectado como user
-Informe o ID (-100...), @username, ou nome exato do chat de ORIGEM: -112345678910
-Tópico no destino: 'Grupo Exemplo'
-top_msg_id = 1501
-Iniciando cópia…
-100 mensagens encaminhadas…
-200 mensagens encaminhadas…
-✅ Encaminhamento concluído. Total: 356
+python CopiarGrupo.py
+Conectado como usuario
+Dica: pressione Enter ou digite 'listar' para ver seus grupos com ID.
 
-Deseja copiar outro grupo? (s/n): s
+  #  ID                    Tipo      Nome
+  1  -1002761889423        Fórum     SCRIPTS E AMIGOS
+  2  -1004497720243        Fórum     SCRIPTS DECO
+
+Selecione a ORIGEM a copiar:
+> 1
+Selecionado: SCRIPTS E AMIGOS (-1002761889423)
+
+Deseja CRIAR um novo supergrupo com tópicos como destino? (s/n): s
+Nome do novo supergrupo [SCRIPTS E AMIGOS (Cópia)]: SCRIPTS DECO
+Descrição do grupo (opcional, Enter para pular): Scripts, apks e ferramentas
+✅ Supergrupo criado: 'SCRIPTS DECO'
+   ID: -1004497720243
+
+📂 Origem detectada como comunidade com tópicos.
+
+📋 13 tópico(s) encontrado(s) na origem.
+
+[1/13] Tópico: '# BATE PAPO'
+  top_msg_id destino = 2
+  Iniciando cópia…
+  100 mensagens encaminhadas…
+  ✅ Tópico concluído: 156 mensagem(ns)
+
+[2/13] Tópico: 'NOVIDADE'
+  ...
+
+✅ Comunidade clonada. Total geral: 4523 mensagem(ns)
+
+Deseja copiar outro grupo? (s/n): n
+Encerrando execução. 👋
 ```
 
-## 🙏 Créditos e agradecimentos
+## 🙏 Créditos
 
-Este projeto utiliza a biblioteca [**Telethon**](https://github.com/LonamiWebs/Telethon),  
-um cliente Python open-source para a API do Telegram, licenciado sob a **MIT License**.
+Projeto original por [replicant026](https://github.com/replicant026/Clonar-Grupo-Telegram).
 
-Agradecimentos especiais à comunidade Telethon por tornar possível o uso da API de forma estável e acessível.
-
-> Telethon © 2015–2025 Lonami Exo — Licensed under the MIT License  
-> [https://github.com/LonamiWebs/Telethon](https://github.com/LonamiWebs/Telethon)
+Este fork utiliza [**Telethon**](https://github.com/LonamiWebs/Telethon) — MIT License.

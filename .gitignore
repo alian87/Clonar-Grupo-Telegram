@@ -1,0 +1,11 @@
+# Credenciais e sessão Telegram (nunca commitar)
+cpgrupo_config.json
+session_forward.session
+session_forward.session-journal
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
