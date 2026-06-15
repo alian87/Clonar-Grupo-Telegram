@@ -26,6 +26,7 @@ Também é possível copiar grupos simples (sem tópicos) para um único tópico
 - **Python 3.10 ou superior**
 - Conta Telegram válida (com número verificado)
 - Biblioteca **Telethon**
+- **FastAPI** e **Uvicorn** (apenas para a interface web com `--web`)
 - Permissão de leitura na comunidade de origem
 - Permissão de administrador no destino (ou crie um grupo novo — você será admin automaticamente)
 
@@ -51,11 +52,33 @@ Também é possível copiar grupos simples (sem tópicos) para um único tópico
 cd C:\Users\seuusuario\Documentos\Clonar-Grupo-Telegram
 ```
 
-2. Rode o script:
+2. Rode o script no **terminal** (modo interativo):
 
 ```bash
 python CopiarGrupo.py
 ```
+
+Ou inicie a **interface web** no navegador:
+
+```bash
+python CopiarGrupo.py --web
+```
+
+A porta padrão é `8765`. Para outra porta:
+
+```bash
+python CopiarGrupo.py --web --port 9000
+```
+
+O navegador abre automaticamente em `http://127.0.0.1:8765`. Na web você pode:
+
+- Configurar API ID e HASH (primeira vez)
+- Fazer login no Telegram (telefone + código, e senha 2FA se necessário)
+- Listar grupos e escolher origem/destino
+- Escolher o modo: primeira cópia, incremental, semear sync ou recomeçar
+- Acompanhar o log em tempo real e o contador de FloodWait
+
+Sem o parâmetro `--web`, o fluxo continua pelo terminal como antes.
 
 ### Na **primeira execução**, o script solicitará:
 
@@ -286,11 +309,21 @@ python CopiarGrupo.py --reset-sync
 
 ### ⏳ FloodWait (limite do Telegram)
 
-O Telegram limita quantas mensagens podem ser encaminhadas por hora. Quando isso acontece, aparece:
+O Telegram limita quantas mensagens podem ser encaminhadas por hora. Quando isso acontece, o script exibe:
 
 ```
-⏳ FloodWait: aguardando 2471s (~41 min 11s)…
+  ═══════════════════════════════════════
+  ⏳ FLOODWAIT — limite temporário do Telegram
+  🕐 Início da pausa:  15/06/2026 14:32:10
+  🕑 Retomada prevista: 15/06/2026 15:13:21
+  ⏱️  Duração total:    41:11 (2471s)
+  💡 Não feche o terminal — o script continua sozinho.
+  ═══════════════════════════════════════
+
+  ⏳ Aguardando... faltam 38:45 | retoma às 15:13:21
 ```
+
+O contador **atualiza a cada segundo** na mesma linha.
 
 **Isso é normal** em cópias grandes — não é bloqueio permanente. O script aguarda e **continua sozinho**.
 
