@@ -88,24 +88,25 @@ Depois da **primeira cópia completa** entre um par de grupos (origem → destin
 
 ### Quando aparece
 
-Na segunda vez (ou depois) que você copiar **o mesmo par**:
-
-- **Origem:** ex. `SCRIPTS E AMIGOS` (`-1002761889423`)
-- **Destino:** ex. `SCRIPTS DECO` (`-1004497720243`)
-
-O script detecta a cópia anterior e pergunta:
+Na segunda vez (ou depois) que você copiar **o mesmo par**, o script exibe um menu:
 
 ```
-🔄 Cópia anterior detectada para este par de grupos (2026-06-15 14:30 UTC).
-Copiar apenas conteúdo NOVO? (s/n) [s]:
+📋 Como deseja continuar?
+  (r) Recomeçar — APAGA os tópicos do destino e copia tudo de novo
+  (i) Incremental — copia só mensagens novas
+  (s) Semear sync — registra IDs da origem sem copiar
+  (a) Abortar
+Escolha [i]:
 ```
 
 ### O que cada opção faz
 
 | Resposta | Comportamento |
 |----------|---------------|
-| **s** (padrão) | Modo incremental — copia só o que ainda não foi encaminhado |
-| **n** | Cópia completa — recopia **todas** as mensagens de novo (pode duplicar no destino) |
+| **r** | **Recomeçar** — apaga todos os tópicos do destino e copia tudo de novo |
+| **i** (padrão com sync) | Modo incremental — copia só o que ainda não foi encaminhado |
+| **s** | Semear sync — registra IDs da origem sem copiar mensagens |
+| **a** | Abortar |
 
 ### O que é sincronizado no modo incremental
 
@@ -201,9 +202,48 @@ Neste exemplo:
 
 ### Como forçar uma cópia completa de novo
 
-**Opção 1 — na execução:** responda **n** quando perguntado sobre conteúdo novo.
+**Opção 1 — na execução:** responda **n** quando perguntado sobre conteúdo novo e confirme que aceita duplicar.
 
-**Opção 2 — apagar o histórico:** delete `cpgrupo_sync.json` (ou só a entrada do par dentro dele) e rode o script normalmente.
+**Opção 2 — apagar o histórico:** delete `cpgrupo_sync.json` ou rode:
+
+```bash
+python CopiarGrupo.py --reset-sync
+```
+
+### Mensagens duplicadas no destino
+
+Se o destino tiver **mais mensagens** que a origem (ex.: 2712 no seu grupo vs 2013 no original), as causas mais comuns são:
+
+1. **Cópia completa rodada mais de uma vez** (antes do sync existir ou respondendo `n`)
+2. **Primeira cópia feita antes** do `cpgrupo_sync.json` — na segunda execução tudo foi copiado de novo
+3. **Responder `n`** em "copiar apenas conteúdo novo" — recopia tudo e duplica
+
+#### Como corrigir (ex.: SCRIPTS COMPARTILHADA)
+
+**Passo 1 — Semear o sync sem copiar nada** (recomendado se o destino já está quase completo):
+
+```bash
+python CopiarGrupo.py
+```
+
+- Mesma origem e mesmo destino
+- Quando aparecer a opção, escolha **(s) Semear sync sem copiar**
+
+Isso registra o último ID de cada tópico da origem **sem encaminhar mensagens**. Da próxima vez, o modo incremental (`s`) copia só o que for novo.
+
+**Passo 2 — Recomeçar do zero (recomendado se há muitas duplicatas):**
+
+```bash
+python CopiarGrupo.py
+```
+
+- Mesma origem e destino
+- Escolha **(r) Recomeçar**
+- Digite **APAGAR** para confirmar
+
+O script apaga todos os tópicos do destino e copia tudo de novo, sem duplicatas.
+
+**Alternativa manual:** apague os tópicos no Telegram e rode uma cópia completa com `--reset-sync`.
 
 ---
 
@@ -214,6 +254,12 @@ python CopiarGrupo.py --reset
 ```
 
 Isso apaga `cpgrupo_config.json` e solicita novamente API ID e API HASH.
+
+Para apagar só o histórico de sincronização:
+
+```bash
+python CopiarGrupo.py --reset-sync
+```
 
 ## 🧱 Estrutura de arquivos
 

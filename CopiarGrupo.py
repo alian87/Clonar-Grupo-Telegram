@@ -46,37 +46,180 @@ def sync_pair_key(from_entity, to_entity) -> str:
     return f"{utils.get_peer_id(from_entity)}:{utils.get_peer_id(to_entity)}"
 
 
-def topic_sync_key(topic) -> str:
-    return (getattr(topic, "title", None) or "Geral").strip()
+def obter_ultimo_id_topico(sync_data, pair_key: str, topic_id: int, title_fallback: str = "") -> int:
+    topics = sync_data.get("pairs", {}).get(pair_key, {}).get("topics", {})
+    key = str(topic_id)
+    if key in topics:
+        return int(topics[key].get("last_msg_id", 0))
+    if title_fallback and title_fallback in topics:
+        return int(topics[title_fallback].get("last_msg_id", 0))
+    return 0
 
 
-def solicitar_modo_incremental(sync_data, pair_key: str) -> bool:
-    pair = sync_data.get("pairs", {}).get(pair_key)
-    if pair:
-        atualizado = pair.get("updated_at", "data desconhecida")
-        print(f"\n🔄 Cópia anterior detectada para este par de grupos ({atualizado}).")
-        resposta = input("Copiar apenas conteúdo NOVO? (s/n) [s]: ").strip().lower()
-        return resposta in ("", "s")
+def registrar_topico_sync(
+    sync_data, pair_key: str, topic_id: int, title: str, last_msg_id: int
+):
+    pairs = sync_data.setdefault("pairs", {})
+    pair = pairs.setdefault(pair_key, {"topics": {}})
+    pair["topics"][str(topic_id)] = {
+        "last_msg_id": last_msg_id,
+        "title": title,
+        "source_topic_id": topic_id,
+    }
+    pair["updated_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+
+def limpar_sync_par(sync_data, pair_key: str):
+    pairs = sync_data.get("pairs", {})
+    if pair_key in pairs:
+        del pairs[pair_key]
+        save_sync(sync_data)
+
+
+def solicitar_modo_sincronizacao(sync_data, pair_key: str, destino_ja_tem_conteudo: bool) -> str:
+    """
+    Retorna: 'incremental', 'full', 'seed', 'rebuild' ou 'cancel'.
+    """
+    tem_sync = pair_key in sync_data.get("pairs", {})
+
+    if destino_ja_tem_conteudo or tem_sync:
+        print("\n📋 Como deseja continuar?")
+        print("  (r) Recomeçar — APAGA os tópicos do destino e copia tudo de novo")
+        if tem_sync:
+            print("  (i) Incremental — copia só mensagens novas")
+        print("  (s) Semear sync — registra IDs da origem sem copiar")
+        print("  (a) Abortar")
+        padrao = "i" if tem_sync else "r"
+        while True:
+            resposta = input(f"Escolha [{padrao}]: ").strip().lower()
+            if not resposta:
+                resposta = padrao
+            if resposta == "r":
+                return "rebuild"
+            if resposta == "i" and tem_sync:
+                return "incremental"
+            if resposta == "s":
+                return "seed"
+            if resposta in ("a", "n"):
+                return "cancel"
+            print("Opção inválida.")
 
     print("\n📥 Primeira cópia deste par — todo o conteúdo será copiado.")
     print("   Nas próximas vezes você poderá sincronizar só o que for novo.")
+    return "full"
+
+
+async def apagar_todos_topicos_destino(client, to_entity):
+    if not await is_forum(client, to_entity):
+        print("⚠️ Destino não é um fórum com tópicos — limpeza automática não disponível.")
+        return False
+
+    topics = await listar_topicos(client, to_entity)
+    if not topics:
+        print("Nenhum tópico encontrado no destino.")
+        return True
+
+    print(f"\n🗑️ Apagando {len(topics)} tópico(s) do destino…")
+    apagados = 0
+
+    for topic in sorted(topics, key=lambda item: item.id, reverse=True):
+        title = topic.title or "Geral"
+        try:
+            await client(
+                functions.messages.DeleteTopicHistoryRequest(
+                    peer=to_entity,
+                    top_msg_id=topic.id,
+                )
+            )
+            apagados += 1
+            print(f"  ✅ Apagado: {title!r}")
+            await asyncio.sleep(SLEEP_BETWEEN)
+        except FloodWaitError as e:
+            print(f"  FloodWait: aguardando {e.seconds}s")
+            await asyncio.sleep(e.seconds + 1)
+            await client(
+                functions.messages.DeleteTopicHistoryRequest(
+                    peer=to_entity,
+                    top_msg_id=topic.id,
+                )
+            )
+            apagados += 1
+            print(f"  ✅ Apagado: {title!r}")
+        except Exception as e:
+            print(f"  ⚠️ Não foi possível apagar {title!r}: {e}")
+
+    print(f"🗑️ Limpeza concluída ({apagados}/{len(topics)} tópico(s)).")
+    return apagados > 0
+
+
+def confirmar_recomeco(nome_destino: str) -> bool:
+    print("\n⚠️  ATENÇÃO: todos os tópicos e mensagens do DESTINO serão apagados.")
+    print("   Esta ação não pode ser desfeita pelo script.")
+    confirma = input(
+        f"Para confirmar, digite APAGAR (grupo: {nome_destino}): "
+    ).strip()
+    return confirma == "APAGAR"
+
+
+async def destino_topico_tem_conteudo(client, entity, dest_topic_id) -> bool:
+    kwargs = {"limit": 10}
+    if dest_topic_id is not None and dest_topic_id != 1:
+        kwargs["reply_to"] = dest_topic_id
+    async for msg in client.iter_messages(entity, **kwargs):
+        if not isinstance(msg, types.MessageService):
+            return True
     return False
 
 
-def obter_ultimo_id_topico(sync_data, pair_key: str, titulo_topico: str) -> int:
-    pair = sync_data.get("pairs", {}).get(pair_key, {})
-    topico = pair.get("topics", {}).get(titulo_topico, {})
-    return int(topico.get("last_msg_id", 0))
+async def destino_parece_ter_copia(client, to_entity) -> bool:
+    if not await is_forum(client, to_entity):
+        return await destino_topico_tem_conteudo(client, to_entity, None)
+    topics = await listar_topicos(client, to_entity)
+    for topic in topics:
+        if topic.id == 1:
+            continue
+        if await destino_topico_tem_conteudo(client, to_entity, topic.id):
+            return True
+    return False
 
 
-def registrar_topico_sync(sync_data, pair_key: str, titulo_topico: str, source_topic_id: int, last_msg_id: int):
-    pairs = sync_data.setdefault("pairs", {})
-    pair = pairs.setdefault(pair_key, {"topics": {}})
-    pair["topics"][titulo_topico] = {
-        "last_msg_id": last_msg_id,
-        "source_topic_id": source_topic_id,
-    }
-    pair["updated_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+async def obter_max_msg_id_origem(client, from_entity, source_topic_id, other_topic_ids):
+    max_id = 0
+    if source_topic_id is not None and source_topic_id != 1:
+        iterator = client.iter_messages(from_entity, reply_to=source_topic_id)
+    else:
+        iterator = client.iter_messages(from_entity)
+    async for msg in iterator:
+        if source_topic_id is not None:
+            if not _mensagem_no_topico(msg, source_topic_id, other_topic_ids):
+                continue
+        if isinstance(msg, types.MessageService):
+            continue
+        max_id = max(max_id, msg.id)
+    return max_id
+
+
+async def semear_sync_da_origem(client, from_entity, to_entity, sync_data):
+    pair_key = sync_pair_key(from_entity, to_entity)
+    topics = await listar_topicos(client, from_entity)
+    other_topic_ids = {t.id for t in topics if t.id != 1}
+    print("\n🌱 Semeando sync a partir da origem (sem copiar mensagens)…")
+
+    if not topics:
+        max_id = await obter_max_msg_id_origem(client, from_entity, 1, set())
+        registrar_topico_sync(sync_data, pair_key, 1, "Geral", max_id)
+        print(f"  Geral: último id registrado = {max_id}")
+    else:
+        for topic in topics:
+            title = topic.title or "Geral"
+            max_id = await obter_max_msg_id_origem(
+                client, from_entity, topic.id, other_topic_ids
+            )
+            registrar_topico_sync(sync_data, pair_key, topic.id, title, max_id)
+            print(f"  {title!r}: último id registrado = {max_id}")
+
+    save_sync(sync_data)
+    print("✅ Sync inicializado. Nas próximas execuções use modo incremental (s).")
 
 
 def first_time_setup(existing_cfg=None):
@@ -498,6 +641,8 @@ async def copiar_mensagens_topico(
         message_iter = client.iter_messages(from_entity, reverse=True)
 
     async for msg in message_iter:
+        if isinstance(msg, types.MessageService):
+            continue
         if source_topic_id is not None:
             if not _mensagem_no_topico(msg, source_topic_id, other_topic_ids):
                 continue
@@ -547,16 +692,19 @@ async def copiar_comunidade_forum(client, from_entity, to_entity, incremental=Fa
 
     if not topics:
         print("⚠️ Nenhum tópico encontrado na origem. Copiando mensagens no tópico Geral…")
-        titulo = "Geral"
-        min_id = obter_ultimo_id_topico(sync_data, pair_key, titulo) if incremental else 0
+        title = "Geral"
+        min_id = obter_ultimo_id_topico(sync_data, pair_key, 1, title) if incremental else 0
         if incremental and min_id:
             print(f"  Última mensagem copiada: id {min_id}")
+        elif incremental and min_id == 0 and await destino_topico_tem_conteudo(client, to_entity, None):
+            print("  ⚠️ Destino já tem mensagens sem histórico de sync. Pulando para evitar duplicatas.")
+            print("  Use a opção 'semear sync' na próxima execução.")
+            return
         total, max_id = await copiar_mensagens_topico(
             client, from_entity, to_entity, 1, None, set(), min_msg_id=min_id
         )
-        if incremental:
-            registrar_topico_sync(sync_data, pair_key, titulo, 1, max_id)
-            save_sync(sync_data)
+        registrar_topico_sync(sync_data, pair_key, 1, title, max_id)
+        save_sync(sync_data)
         if total == 0 and incremental:
             print("  Nenhuma mensagem nova.")
         print(f"\n✅ Cópia concluída. Total: {total} mensagem(ns)\n")
@@ -573,10 +721,9 @@ async def copiar_comunidade_forum(client, from_entity, to_entity, incremental=Fa
 
     for index, topic in enumerate(topics, 1):
         title = topic.title or "Geral"
-        titulo_sync = topic_sync_key(topic)
         print(f"\n[{index}/{len(topics)}] Tópico: {title!r}")
 
-        min_id = obter_ultimo_id_topico(sync_data, pair_key, titulo_sync) if incremental else 0
+        min_id = obter_ultimo_id_topico(sync_data, pair_key, topic.id, title) if incremental else 0
         if incremental and min_id:
             print(f"  Última mensagem copiada: id {min_id}")
 
@@ -592,6 +739,15 @@ async def copiar_comunidade_forum(client, from_entity, to_entity, incremental=Fa
             print(f"  ❌ Erro ao preparar tópico: {e}")
             continue
 
+        if incremental and min_id == 0:
+            tem_conteudo = await destino_topico_tem_conteudo(
+                client, to_entity, dest_top_id if topic.id != 1 else None
+            )
+            if tem_conteudo:
+                print("  ⚠️ Tópico já tem mensagens no destino sem histórico de sync.")
+                print("  Pulando para evitar duplicatas. Use 'semear sync' na próxima execução.")
+                continue
+
         print("  Iniciando cópia…")
         try:
             total, max_id = await copiar_mensagens_topico(
@@ -603,7 +759,7 @@ async def copiar_comunidade_forum(client, from_entity, to_entity, incremental=Fa
                 other_topic_ids,
                 min_msg_id=min_id,
             )
-            registrar_topico_sync(sync_data, pair_key, titulo_sync, topic.id, max_id)
+            registrar_topico_sync(sync_data, pair_key, topic.id, title, max_id)
             save_sync(sync_data)
             grand_total += total
             if total == 0 and incremental:
@@ -632,7 +788,6 @@ async def copiar_grupo_simples(
         from_entity, "first_name", "Origem"
     )
     topic_title = origem_title[:128]
-    titulo_sync = topic_title
     print(f"Tópico no destino: {topic_title!r}")
 
     try:
@@ -643,24 +798,43 @@ async def copiar_grupo_simples(
         print("⚠️ Sem permissão para criar tópicos no destino. Encaminhando SEM tópico.")
         top_msg_id = None
 
-    min_id = obter_ultimo_id_topico(sync_data, pair_key, titulo_sync) if incremental else 0
+    min_id = obter_ultimo_id_topico(sync_data, pair_key, 0, topic_title) if incremental else 0
     if incremental and min_id:
         print(f"Última mensagem copiada: id {min_id}")
         print("🔄 Modo incremental: copiando apenas mensagens novas.")
+    elif incremental and min_id == 0 and await destino_topico_tem_conteudo(client, to_entity, top_msg_id):
+        print("⚠️ Destino já tem mensagens sem histórico de sync. Pulando para evitar duplicatas.")
+        return
 
     print("Iniciando cópia…")
     total, max_id = await copiar_mensagens_topico(
         client, from_entity, to_entity, None, top_msg_id, min_msg_id=min_id
     )
-    registrar_topico_sync(sync_data, pair_key, titulo_sync, 0, max_id)
+    registrar_topico_sync(sync_data, pair_key, 0, topic_title, max_id)
     save_sync(sync_data)
     if total == 0 and incremental:
         print("Nenhuma mensagem nova.")
     print(f"✅ Encaminhamento concluído. Total: {total}\n")
 
 
-async def copiar_origem(client, from_entity, to_entity, incremental=False):
+async def copiar_origem(client, from_entity, to_entity, mode="full"):
     sync_data = load_sync()
+    pair_key = sync_pair_key(from_entity, to_entity)
+
+    if mode == "seed":
+        await semear_sync_da_origem(client, from_entity, to_entity, sync_data)
+        return
+
+    if mode == "rebuild":
+        nome_destino = getattr(to_entity, "title", None) or "destino"
+        if not confirmar_recomeco(nome_destino):
+            print("Operação cancelada.")
+            return
+        await apagar_todos_topicos_destino(client, to_entity)
+        limpar_sync_par(sync_data, pair_key)
+        mode = "full"
+
+    incremental = mode == "incremental"
     if await is_forum(client, from_entity):
         print("📂 Origem detectada como comunidade com tópicos.")
         await copiar_comunidade_forum(
@@ -673,7 +847,11 @@ async def copiar_origem(client, from_entity, to_entity, incremental=False):
         )
 
 
-async def main(reset=False):
+async def main(reset=False, reset_sync=False):
+    if reset_sync and SYNC_FILE.exists():
+        SYNC_FILE.unlink()
+        print("✅ Histórico de sync apagado (cpgrupo_sync.json).")
+
     cfg = ensure_config(reset=reset)
     api_id = cfg["api_id"]
     api_hash = cfg["api_hash"]
@@ -695,8 +873,12 @@ async def main(reset=False):
                 to_entity = await resolver_destino_interativo(client, cfg, from_entity, grupos)
                 sync_data = load_sync()
                 pair_key = sync_pair_key(from_entity, to_entity)
-                incremental = solicitar_modo_incremental(sync_data, pair_key)
-                await copiar_origem(client, from_entity, to_entity, incremental=incremental)
+                destino_tem_conteudo = await destino_parece_ter_copia(client, to_entity)
+                mode = solicitar_modo_sincronizacao(sync_data, pair_key, destino_tem_conteudo)
+                if mode == "cancel":
+                    print("Operação cancelada.")
+                    continue
+                await copiar_origem(client, from_entity, to_entity, mode=mode)
             except Exception as e:
                 print(f"❌ Erro ao copiar: {e}")
 
@@ -715,5 +897,10 @@ if __name__ == "__main__":
         action="store_true",
         help="Refazer configuração (API ID/HASH).",
     )
+    parser.add_argument(
+        "--reset-sync",
+        action="store_true",
+        help="Apagar histórico de sincronização incremental (cpgrupo_sync.json).",
+    )
     args = parser.parse_args()
-    asyncio.run(main(reset=args.reset))
+    asyncio.run(main(reset=args.reset, reset_sync=args.reset_sync))
