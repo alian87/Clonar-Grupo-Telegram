@@ -202,6 +202,33 @@
     }
     .selection-card strong { display: block; font-size: 0.95rem; }
     .selection-card .id { font-size: 0.8rem; color: var(--muted); font-family: monospace; }
+    #sync-table input[type="number"] {
+      width: 8rem;
+      margin-bottom: 0;
+      padding: 0.35rem 0.5rem;
+    }
+    #sync-json {
+      font-family: "Cascadia Code", "Consolas", monospace;
+      font-size: 0.82rem;
+      min-height: 240px;
+      resize: vertical;
+    }
+    .sync-toolbar {
+      display: flex;
+      gap: 0.75rem;
+      flex-wrap: wrap;
+      align-items: center;
+      margin-bottom: 0.75rem;
+    }
+    .sync-toolbar label {
+      display: flex;
+      align-items: center;
+      gap: 0.35rem;
+      margin: 0;
+      color: var(--text);
+      cursor: pointer;
+    }
+    .sync-toolbar label input { width: auto; margin: 0; }
     #log-panel {
       height: 280px;
       overflow-y: auto;
@@ -335,6 +362,43 @@
       </section>
     </div>
 
+    <section id="sec-sync" class="hidden">
+      <h2>Histórico de sync (cpgrupo_sync.json)</h2>
+      <p class="hint" id="sync-file-hint"></p>
+      <div class="sync-toolbar">
+        <button type="button" class="secondary" id="btn-sync-reload">Recarregar</button>
+        <button type="button" id="btn-sync-save">Salvar alterações</button>
+        <label>
+          <input type="checkbox" id="chk-sync-json" />
+          Editor JSON completo
+        </label>
+        <span class="hint" id="sync-pair-hint" style="margin:0"></span>
+      </div>
+      <p class="hint" style="margin-top:0">
+        O <code>last_msg_id</code> indica até onde cada tópico foi copiado. Coloque <strong>0</strong> nos tópicos que falharam e salve; depois use modo <strong>Incremental</strong>.
+      </p>
+      <div id="sync-table-wrap">
+        <div style="overflow-x:auto; max-height:360px; overflow-y:auto">
+          <table id="sync-table">
+            <thead>
+              <tr>
+                <th>Par origem:destino</th>
+                <th>Tópico</th>
+                <th>Título</th>
+                <th>last_msg_id</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody id="sync-topics-body"></tbody>
+          </table>
+        </div>
+      </div>
+      <div id="sync-json-wrap" class="hidden">
+        <label for="sync-json">Conteúdo do arquivo</label>
+        <textarea id="sync-json" spellcheck="false"></textarea>
+      </div>
+    </section>
+
     <section id="sec-log">
       <h2>Log em tempo real</h2>
       <div id="flood-box" class="hidden">
@@ -356,6 +420,7 @@
     let destinoId = null;
     let jobRunning = false;
     let ws = null;
+    let syncData = { pairs: {} };
 
     function appendLog(msg) {
       const line = document.createElement("div");
@@ -413,7 +478,14 @@
         ...opts,
       });
       const data = await res.json().catch(() => ({}));
-      if (!res.ok) throw new Error(data.detail || res.statusText);
+      if (!res.ok) {
+        let msg = data.detail || res.statusText;
+        if (Array.isArray(msg)) msg = msg.map((e) => e.msg || String(e)).join(", ");
+        if (res.status === 404) {
+          msg += " — reinicie o servidor: python CopiarGrupo.py --web";
+        }
+        throw new Error(msg);
+      }
       return data;
     }
 
@@ -425,6 +497,7 @@
         $("#sec-config").classList.remove("hidden");
         $("#sec-auth").classList.add("hidden");
         $("#sec-main").classList.add("hidden");
+        $("#sec-sync").classList.add("hidden");
         setStatus("Configure API ID e HASH", false);
         return;
       }
@@ -433,17 +506,166 @@
       if (!st.connected) {
         $("#sec-auth").classList.remove("hidden");
         $("#sec-main").classList.add("hidden");
+        $("#sec-sync").classList.add("hidden");
         setStatus("Faça login no Telegram", false);
         return;
       }
       $("#sec-auth").classList.add("hidden");
       $("#sec-main").classList.remove("hidden");
+      $("#sec-sync").classList.remove("hidden");
       setStatus(`Conectado: ${st.user || "ok"}`, true);
 
       if (st.destino_id && !destinoId) {
         destinoId = st.destino_id;
       }
       await loadGroups();
+      await loadSync();
+    }
+
+    function getActivePairKey() {
+      const criar = $("#chk-criar-destino").checked;
+      if (origemId && destinoId && !criar) {
+        return `${origemId}:${destinoId}`;
+      }
+      return null;
+    }
+
+    function updateSyncPairHint() {
+      const key = getActivePairKey();
+      const el = $("#sync-pair-hint");
+      if (key && syncData.pairs?.[key]) {
+        el.textContent = `Filtrando par: ${key}`;
+      } else if (key) {
+        el.textContent = `Par ${key} ainda sem histórico`;
+      } else {
+        el.textContent = "Mostrando todos os pares";
+      }
+    }
+
+    async function loadSync() {
+      try {
+        const res = await api("/api/sync");
+        syncData = { pairs: res.pairs || {} };
+        const hint = $("#sync-file-hint");
+        if (res.file_path) {
+          hint.textContent = res.file_exists
+            ? `Arquivo: ${res.file_path}`
+            : `Arquivo ainda não criado (${res.file_path}) — será gerado ao salvar ou ao copiar.`;
+        }
+        renderSyncTable();
+        $("#sync-json").value = JSON.stringify(syncData, null, 2);
+        updateSyncPairHint();
+      } catch (e) {
+        appendLog("❌ Erro ao carregar sync: " + e.message);
+      }
+    }
+
+    function renderSyncTable() {
+      const tbody = $("#sync-topics-body");
+      tbody.innerHTML = "";
+      const pairs = syncData.pairs || {};
+      const activeKey = getActivePairKey();
+      const keys = activeKey
+        ? (pairs[activeKey] ? [activeKey] : [])
+        : Object.keys(pairs).sort();
+
+      if (keys.length === 0) {
+        const tr = document.createElement("tr");
+        tr.innerHTML = '<td colspan="5" style="color:var(--muted)">Nenhum histórico salvo.</td>';
+        tbody.appendChild(tr);
+        return;
+      }
+
+      keys.forEach((pairKey) => {
+        const topics = pairs[pairKey]?.topics || {};
+        const entries = Object.entries(topics).sort((a, b) => {
+          const na = parseInt(a[0], 10);
+          const nb = parseInt(b[0], 10);
+          if (!isNaN(na) && !isNaN(nb)) return na - nb;
+          return String(a[0]).localeCompare(String(b[0]));
+        });
+
+        if (entries.length === 0) {
+          const tr = document.createElement("tr");
+          tr.innerHTML = `<td colspan="5"><code>${escapeHtml(pairKey)}</code> — sem tópicos</td>`;
+          tbody.appendChild(tr);
+          return;
+        }
+
+        entries.forEach(([topicKey, topic]) => {
+          const tr = document.createElement("tr");
+          const lastId = topic?.last_msg_id ?? 0;
+          const title = topic?.title ?? "";
+          tr.innerHTML = `
+            <td><code>${escapeHtml(pairKey)}</code></td>
+            <td>${escapeHtml(topicKey)}</td>
+            <td>${escapeHtml(title)}</td>
+            <td>
+              <input type="number" class="sync-last-id" min="0"
+                data-pair="${escapeHtml(pairKey)}" data-topic="${escapeHtml(topicKey)}"
+                value="${lastId}" />
+            </td>
+            <td>
+              <button type="button" class="secondary btn-sync-zero"
+                data-pair="${escapeHtml(pairKey)}" data-topic="${escapeHtml(topicKey)}">Zerar</button>
+            </td>
+          `;
+          tbody.appendChild(tr);
+        });
+      });
+
+      tbody.querySelectorAll(".btn-sync-zero").forEach((btn) => {
+        btn.addEventListener("click", () => {
+          const sel = `.sync-last-id[data-pair="${CSS.escape(btn.dataset.pair)}"][data-topic="${CSS.escape(btn.dataset.topic)}"]`;
+          const inp = tbody.querySelector(sel);
+          if (inp) inp.value = "0";
+        });
+      });
+    }
+
+    function collectSyncFromTable() {
+      document.querySelectorAll(".sync-last-id").forEach((inp) => {
+        const pairKey = inp.dataset.pair;
+        const topicKey = inp.dataset.topic;
+        const topic = syncData.pairs?.[pairKey]?.topics?.[topicKey];
+        if (!topic) return;
+        const val = parseInt(inp.value, 10);
+        topic.last_msg_id = Number.isNaN(val) ? 0 : Math.max(0, val);
+      });
+      $("#sync-json").value = JSON.stringify(syncData, null, 2);
+    }
+
+    async function saveSync() {
+      if (jobRunning) {
+        appendLog("❌ Aguarde o fim da cópia para editar o sync.");
+        return;
+      }
+      let payload;
+      if ($("#chk-sync-json").checked) {
+        try {
+          payload = JSON.parse($("#sync-json").value);
+        } catch (e) {
+          appendLog("❌ JSON inválido: " + e.message);
+          return;
+        }
+      } else {
+        collectSyncFromTable();
+        payload = syncData;
+      }
+      try {
+        await api("/api/sync", {
+          method: "PUT",
+          body: JSON.stringify(payload),
+        });
+        syncData = payload;
+        if (!syncData.pairs) syncData = { pairs: {} };
+        renderSyncTable();
+        $("#sync-json").value = JSON.stringify(syncData, null, 2);
+        await loadSync();
+        appendLog("✅ cpgrupo_sync.json salvo.");
+      } catch (e) {
+        appendLog("❌ " + e.message);
+      }
     }
 
     async function loadGroups() {
@@ -474,6 +696,8 @@
           origemId = g.peer_id;
           renderGroups();
           updateLabels();
+          updateSyncPairHint();
+          renderSyncTable();
         });
         tr.querySelector(".btn-row.dest").addEventListener("click", (e) => {
           e.stopPropagation();
@@ -482,6 +706,8 @@
           destinoId = g.peer_id;
           renderGroups();
           updateLabels();
+          updateSyncPairHint();
+          renderSyncTable();
         });
         tbody.appendChild(tr);
       });
@@ -533,6 +759,7 @@
         appendLog("——— Cópia concluída ———");
         updateStartButton();
         refreshStatus();
+        loadSync();
       }
       if (data.type === "job_error") {
         jobRunning = false;
@@ -608,6 +835,28 @@
       $("#criar-fields").classList.toggle("hidden", !on);
       if (on) destinoId = null;
       updateLabels();
+      updateSyncPairHint();
+      renderSyncTable();
+    });
+
+    $("#btn-sync-reload").addEventListener("click", loadSync);
+    $("#btn-sync-save").addEventListener("click", saveSync);
+    $("#chk-sync-json").addEventListener("change", () => {
+      const jsonMode = $("#chk-sync-json").checked;
+      $("#sync-json-wrap").classList.toggle("hidden", !jsonMode);
+      $("#sync-table-wrap").classList.toggle("hidden", jsonMode);
+      if (jsonMode) {
+        collectSyncFromTable();
+        $("#sync-json").value = JSON.stringify(syncData, null, 2);
+      } else {
+        try {
+          syncData = JSON.parse($("#sync-json").value);
+          if (!syncData.pairs) syncData = { pairs: {} };
+        } catch (e) {
+          appendLog("❌ JSON inválido — mantendo tabela anterior.");
+        }
+        renderSyncTable();
+      }
     });
 
     document.querySelectorAll('input[name="mode"]').forEach((el) => {

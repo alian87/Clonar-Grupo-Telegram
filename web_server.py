@@ -237,3 +237,68 @@ async def api_copy(body: CopyIn):
 
     asyncio.create_task(job())
     return {"ok": True}
+
+
+def _validar_sync(data) -> dict:
+    if not isinstance(data, dict):
+        raise HTTPException(status_code=400, detail="O JSON deve ser um objeto.")
+    if "pairs" not in data:
+        data = {"pairs": {}}
+    pairs = data.get("pairs")
+    if not isinstance(pairs, dict):
+        raise HTTPException(status_code=400, detail="'pairs' deve ser um objeto.")
+    for pair_key, pair in pairs.items():
+        if not isinstance(pair, dict):
+            raise HTTPException(
+                status_code=400, detail=f"Par '{pair_key}' inválido."
+            )
+        topics = pair.get("topics", {})
+        if not isinstance(topics, dict):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Tópicos do par '{pair_key}' devem ser um objeto.",
+            )
+        for topic_key, topic in topics.items():
+            if not isinstance(topic, dict):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Tópico '{topic_key}' do par '{pair_key}' inválido.",
+                )
+            if "last_msg_id" in topic:
+                try:
+                    topic["last_msg_id"] = int(topic["last_msg_id"])
+                except (TypeError, ValueError):
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"last_msg_id inválido no tópico '{topic_key}'.",
+                    )
+    return data
+
+
+@app.get("/api/sync")
+async def api_get_sync():
+    """Lê cpgrupo_sync.json local; não exige sessão Telegram."""
+    data = cg.load_sync()
+    return {
+        **data,
+        "file_exists": cg.SYNC_FILE.exists(),
+        "file_path": str(cg.SYNC_FILE.resolve()),
+    }
+
+
+@app.put("/api/sync")
+async def api_put_sync(body: dict):
+    if state.job_running:
+        raise HTTPException(
+            status_code=409,
+            detail="Aguarde o fim da cópia em andamento para editar o sync.",
+        )
+    # Aceita corpo com ou sem metadados _file_*
+    payload = {k: v for k, v in body.items() if not k.startswith("file_")}
+    data = _validar_sync(payload)
+    cg.save_sync(data)
+    return {
+        "ok": True,
+        "file_exists": True,
+        "file_path": str(cg.SYNC_FILE.resolve()),
+    }
