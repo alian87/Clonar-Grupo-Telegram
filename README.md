@@ -16,7 +16,7 @@ Também é possível copiar grupos simples (sem tópicos) para um único tópico
 - Encaminhamento em **lotes** (reduz risco de `FloodWait`).
 - **Armazena credenciais** (`api_id`, `api_hash`) no arquivo `cpgrupo_config.json`.
 - **Lista seus grupos com ID** — exibe todos os grupos da conta para facilitar a seleção.
-- **Sincronização incremental** — na 2ª execução, copia só mensagens novas por tópico.
+- **Sincronização incremental** — nas próximas execuções, copia só o que mudou (mensagens novas e tópicos novos).
 - Permite copiar **vários grupos em sequência** sem reiniciar o script.
 
 ----
@@ -80,20 +80,134 @@ Esses dados serão salvos em `cpgrupo_config.json`.
 
 Ao final, pergunta se deseja copiar outro grupo.
 
-### 🔄 Sincronizar só conteúdo novo
+---
 
-Na **segunda cópia** do mesmo par origem → destino, o script detecta a cópia anterior e pergunta:
+## 🔄 Sincronização incremental (copiar só o que é novo)
+
+Depois da **primeira cópia completa** entre um par de grupos (origem → destino), o script passa a oferecer o modo incremental.
+
+### Quando aparece
+
+Na segunda vez (ou depois) que você copiar **o mesmo par**:
+
+- **Origem:** ex. `SCRIPTS E AMIGOS` (`-1002761889423`)
+- **Destino:** ex. `SCRIPTS DECO` (`-1004497720243`)
+
+O script detecta a cópia anterior e pergunta:
 
 ```
+🔄 Cópia anterior detectada para este par de grupos (2026-06-15 14:30 UTC).
 Copiar apenas conteúdo NOVO? (s/n) [s]:
 ```
 
-- **s** (padrão) → copia só mensagens que ainda não foram encaminhadas, tópico por tópico.
-- **n** → recopia tudo do zero (útil se algo deu errado).
+### O que cada opção faz
 
-O progresso fica salvo em `cpgrupo_sync.json` (local, não commitar).
+| Resposta | Comportamento |
+|----------|---------------|
+| **s** (padrão) | Modo incremental — copia só o que ainda não foi encaminhado |
+| **n** | Cópia completa — recopia **todas** as mensagens de novo (pode duplicar no destino) |
 
-### 🔄 Reconfiguração
+### O que é sincronizado no modo incremental
+
+| Situação na origem | O que o script faz no destino |
+|--------------------|-------------------------------|
+| **Mensagens novas** em tópico que já existia | Encaminha só as mensagens com ID maior que a última copiada |
+| **Tópico novo** criado na origem | Cria o tópico correspondente no destino e copia **todas** as mensagens dele |
+| **Tópico sem novidades** | Exibe `Nenhuma mensagem nova.` e segue para o próximo |
+| **Grupo simples** (sem fórum) | Mesma lógica: só mensagens novas desde a última sincronização |
+
+### Como o script sabe o que já foi copiado
+
+O progresso é salvo localmente em `cpgrupo_sync.json`, organizado assim:
+
+```json
+{
+  "pairs": {
+    "-1002761889423:-1004497720243": {
+      "updated_at": "2026-06-15 14:30 UTC",
+      "topics": {
+        "BATE PAPO": {
+          "last_msg_id": 8542,
+          "source_topic_id": 1
+        },
+        "NOVIDADE": {
+          "last_msg_id": 12001,
+          "source_topic_id": 3
+        }
+      }
+    }
+  }
+}
+```
+
+- **Chave do par:** `ID_origem:ID_destino`
+- **Chave do tópico:** nome exato do tópico na origem
+- **last_msg_id:** ID da última mensagem já encaminhada daquele tópico
+
+> ⚠️ **Não apague** `cpgrupo_sync.json` se quiser continuar sincronizando. Se apagar, a próxima execução será tratada como primeira cópia daquele par.
+
+> ⚠️ **Não commite** `cpgrupo_sync.json` — é específico da sua máquina.
+
+### Passo a passo para sincronizar
+
+1. Rode `python CopiarGrupo.py`
+2. Selecione a **mesma origem** de antes
+3. Selecione o **mesmo destino** de antes (`n` → escolha o grupo existente)
+4. Responda **s** em `Copiar apenas conteúdo NOVO?`
+5. Aguarde — só tópicos com novidades serão processados
+
+### Exemplo de saída (modo incremental)
+
+```bash
+🔄 Cópia anterior detectada para este par de grupos (2026-06-15 14:30 UTC).
+Copiar apenas conteúdo NOVO? (s/n) [s]: s
+
+📂 Origem detectada como comunidade com tópicos.
+🔄 Modo incremental: copiando apenas mensagens novas por tópico.
+
+📋 19 tópico(s) encontrado(s) na origem.
+
+[1/19] Tópico: 'BATE PAPO'
+  Última mensagem copiada: id 8542
+  ↪ Tópico já existe no destino, reutilizando: 'BATE PAPO'
+  Iniciando cópia…
+  Nenhuma mensagem nova.
+
+[2/19] Tópico: 'NOVIDADE'
+  Última mensagem copiada: id 12001
+  Iniciando cópia…
+  8 mensagens encaminhadas…
+  ✅ Tópico concluído: 8 mensagem(ns)
+
+[19/19] Tópico: 'PAINEL NOVO 2026'
+  Iniciando cópia…
+  45 mensagens encaminhadas…
+  ✅ Tópico concluído: 45 mensagem(ns)
+
+✅ Comunidade sincronizada. Total geral: 53 mensagem(ns)
+```
+
+Neste exemplo:
+- `BATE PAPO` não tinha mensagens novas → pulado
+- `NOVIDADE` tinha 8 mensagens novas → copiadas
+- `PAINEL NOVO 2026` é um **tópico novo** na origem → criado no destino e copiado por completo
+
+### Limitações do modo incremental
+
+- **Não detecta mensagens editadas** na origem — só conteúdo novo
+- **Não remove mensagens apagadas** no destino se foram apagadas na origem
+- **Não reordena** mensagens já copiadas
+- Se você responder **n** (cópia completa), as mensagens serão **duplicadas** no destino
+
+### Como forçar uma cópia completa de novo
+
+**Opção 1 — na execução:** responda **n** quando perguntado sobre conteúdo novo.
+
+**Opção 2 — apagar o histórico:** delete `cpgrupo_sync.json` (ou só a entrada do par dentro dele) e rode o script normalmente.
+
+---
+
+### 🔄 Reconfiguração da API
 
 ```bash
 python CopiarGrupo.py --reset
@@ -108,7 +222,9 @@ Isso apaga `cpgrupo_config.json` e solicita novamente API ID e API HASH.
 | **`CopiarGrupo.py`** | Script principal de clonagem. |
 | **`requirements.txt`** | Dependências Python (Telethon). |
 | **`cpgrupo_config.json`** | Armazena `api_id` e `api_hash` (gerado localmente). |
+| **`cpgrupo_sync.json`** | Histórico de sincronização incremental por par de grupos e tópico (gerado localmente). |
 | **`session_forward.session`** | Sessão da sua conta no Telegram (gerado localmente). |
+| **`.gitignore`** | Impede commit de credenciais, sessão e histórico de sync. |
 | **`README.md`** | Instruções de uso. |
 
 ## ⚠️ Avisos e boas práticas
@@ -119,8 +235,10 @@ Isso apaga `cpgrupo_config.json` e solicita novamente API ID e API HASH.
 4. Grupos muito grandes podem gerar `FloodWait` — o script aguarda automaticamente.
 5. Tópicos fechados na origem só serão copiados se sua conta tiver acesso a eles.
 6. Ícones personalizados (emoji premium) podem não ser replicados sem Telegram Premium.
+7. No modo incremental, use sempre o **mesmo par** origem → destino para o histórico funcionar.
+8. Arquivos locais sensíveis: `cpgrupo_config.json`, `session_forward.session` e `cpgrupo_sync.json`.
 
-## 🧠 Exemplo de uso
+## 🧠 Exemplo: primeira cópia (completa)
 
 ```bash
 python CopiarGrupo.py
@@ -158,6 +276,38 @@ Descrição do grupo (opcional, Enter para pular): Scripts, apks e ferramentas
 
 Deseja copiar outro grupo? (s/n): n
 Encerrando execução. 👋
+```
+
+## 🧠 Exemplo: sincronizar depois (só novidades)
+
+Use quando a origem ganhar mensagens ou tópicos novos e o destino já existir:
+
+```bash
+python CopiarGrupo.py
+
+Selecione a ORIGEM a copiar:
+> 1
+Selecionado: SCRIPTS E AMIGOS (-1002761889423)
+
+Deseja CRIAR um novo supergrupo com tópicos como destino? (s/n): n
+
+Selecione o grupo DESTINO:
+> 2
+Selecionado: SCRIPTS DECO (-1004497720243)
+
+🔄 Cópia anterior detectada para este par de grupos (2026-06-15 14:30 UTC).
+Copiar apenas conteúdo NOVO? (s/n) [s]: s
+
+📂 Origem detectada como comunidade com tópicos.
+🔄 Modo incremental: copiando apenas mensagens novas por tópico.
+
+[5/19] Tópico: 'SCRIPTS 2026'
+  Última mensagem copiada: id 3300
+  Iniciando cópia…
+  12 mensagens encaminhadas…
+  ✅ Tópico concluído: 12 mensagem(ns)
+
+✅ Comunidade sincronizada. Total geral: 12 mensagem(ns)
 ```
 
 ## 🙏 Créditos
