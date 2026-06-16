@@ -2,18 +2,49 @@ import argparse
 import asyncio
 import json
 import random
+import re
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from telethon import TelegramClient, functions, types, utils
-from telethon.errors import FloodWaitError, ChatAdminRequiredError
+from telethon.errors import FloodWaitError, ChatAdminRequiredError, RPCError
 
 # ====== CONFIGURAÇÕES PADRÃO ======
 CONFIG_FILE = Path(__file__).with_name("cpgrupo_config.json")
+SYNC_FILE = Path(__file__).with_name("cpgrupo_sync.json")
 SESSION_NAME = "session_forward"
 LIST_LIMIT = 200
-BATCH_SIZE = 50
-SLEEP_BETWEEN = 0.2
+BATCH_SIZE = 20
+SLEEP_BETWEEN = 1.5
+PAUSA_ENTRE_TOPICOS = 5
+WEB_PORT = 8765
 # ===================================
+
+_event_sink = None
+
+
+def set_event_sink(sink):
+    global _event_sink
+    _event_sink = sink
+
+
+async def emit_event(data: dict):
+    if _event_sink is None:
+        return
+    result = _event_sink(data)
+    if asyncio.iscoroutine(result):
+        await result
+
+
+def say(msg="", end="\n", flush=False):
+    text = str(msg)
+    print(text, end=end, flush=flush)
+    if _event_sink is not None and end == "\n":
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(emit_event({"type": "log", "message": text}))
+        except RuntimeError:
+            pass
 
 
 def load_config():
@@ -28,25 +59,229 @@ def save_config(cfg: dict):
         json.dump(cfg, f, ensure_ascii=False, indent=2)
 
 
+def load_sync():
+    if SYNC_FILE.exists():
+        with open(SYNC_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return {"pairs": {}}
+
+
+def save_sync(sync_data: dict):
+    with open(SYNC_FILE, "w", encoding="utf-8") as f:
+        json.dump(sync_data, f, ensure_ascii=False, indent=2)
+
+
+def sync_pair_key(from_entity, to_entity) -> str:
+    return f"{utils.get_peer_id(from_entity)}:{utils.get_peer_id(to_entity)}"
+
+
+def obter_ultimo_id_topico(sync_data, pair_key: str, topic_id: int, title_fallback: str = "") -> int:
+    topics = sync_data.get("pairs", {}).get(pair_key, {}).get("topics", {})
+    key = str(topic_id)
+    if key in topics:
+        return int(topics[key].get("last_msg_id", 0))
+    if title_fallback and title_fallback in topics:
+        return int(topics[title_fallback].get("last_msg_id", 0))
+    return 0
+
+
+def registrar_topico_sync(
+    sync_data, pair_key: str, topic_id: int, title: str, last_msg_id: int
+):
+    pairs = sync_data.setdefault("pairs", {})
+    pair = pairs.setdefault(pair_key, {"topics": {}})
+    pair["topics"][str(topic_id)] = {
+        "last_msg_id": last_msg_id,
+        "title": title,
+        "source_topic_id": topic_id,
+    }
+    pair["updated_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+
+def limpar_sync_par(sync_data, pair_key: str):
+    pairs = sync_data.get("pairs", {})
+    if pair_key in pairs:
+        del pairs[pair_key]
+        save_sync(sync_data)
+
+
+def solicitar_modo_sincronizacao(sync_data, pair_key: str, destino_ja_tem_conteudo: bool) -> str:
+    """
+    Retorna: 'incremental', 'full', 'seed', 'rebuild' ou 'cancel'.
+    """
+    tem_sync = pair_key in sync_data.get("pairs", {})
+
+    if destino_ja_tem_conteudo or tem_sync:
+        say("\n📋 Como deseja continuar?")
+        say("  (r) Recomeçar — APAGA os tópicos do destino e copia tudo de novo")
+        if tem_sync:
+            say("  (i) Incremental — copia só mensagens novas")
+        say("  (s) Semear sync — registra IDs da origem sem copiar")
+        say("  (a) Abortar")
+        padrao = "i" if tem_sync else "r"
+        while True:
+            resposta = input(f"Escolha [{padrao}]: ").strip().lower()
+            if not resposta:
+                resposta = padrao
+            if resposta == "r":
+                return "rebuild"
+            if resposta == "i" and tem_sync:
+                return "incremental"
+            if resposta == "s":
+                return "seed"
+            if resposta in ("a", "n"):
+                return "cancel"
+            say("Opção inválida.")
+
+    say("\n📥 Primeira cópia deste par — todo o conteúdo será copiado.")
+    say("   Nas próximas vezes você poderá sincronizar só o que for novo.")
+    return "full"
+
+
+async def apagar_todos_topicos_destino(client, to_entity):
+    if not await is_forum(client, to_entity):
+        say("⚠️ Destino não é um fórum com tópicos — limpeza automática não disponível.")
+        return False
+
+    topics = await listar_topicos(client, to_entity)
+    if not topics:
+        say("Nenhum tópico encontrado no destino.")
+        return True
+
+    say(f"\n🗑️ Apagando {len(topics)} tópico(s) do destino…")
+    apagados = 0
+
+    for topic in sorted(topics, key=lambda item: item.id, reverse=True):
+        title = topic.title or "Geral"
+        try:
+            await client(
+                functions.messages.DeleteTopicHistoryRequest(
+                    peer=to_entity,
+                    top_msg_id=topic.id,
+                )
+            )
+            apagados += 1
+            say(f"  ✅ Apagado: {title!r}")
+            await asyncio.sleep(SLEEP_BETWEEN)
+        except FloodWaitError as exc:
+            await aguardar_flood(exc)
+            await client(
+                functions.messages.DeleteTopicHistoryRequest(
+                    peer=to_entity,
+                    top_msg_id=topic.id,
+                )
+            )
+            apagados += 1
+            say(f"  ✅ Apagado: {title!r}")
+        except RPCError as exc:
+            if "wait" in str(exc).lower() and "seconds" in str(exc).lower():
+                await aguardar_flood(exc)
+                await client(
+                    functions.messages.DeleteTopicHistoryRequest(
+                        peer=to_entity,
+                        top_msg_id=topic.id,
+                    )
+                )
+                apagados += 1
+                say(f"  ✅ Apagado: {title!r}")
+            else:
+                say(f"  ⚠️ Não foi possível apagar {title!r}: {exc}")
+        except Exception as e:
+            say(f"  ⚠️ Não foi possível apagar {title!r}: {e}")
+
+    say(f"🗑️ Limpeza concluída ({apagados}/{len(topics)} tópico(s)).")
+    return apagados > 0
+
+
+def confirmar_recomeco(nome_destino: str) -> bool:
+    say("\n⚠️  ATENÇÃO: todos os tópicos e mensagens do DESTINO serão apagados.")
+    say("   Esta ação não pode ser desfeita pelo script.")
+    confirma = input(
+        f"Para confirmar, digite APAGAR (grupo: {nome_destino}): "
+    ).strip()
+    return confirma == "APAGAR"
+
+
+async def destino_topico_tem_conteudo(client, entity, dest_topic_id) -> bool:
+    kwargs = {"limit": 10}
+    if dest_topic_id is not None and dest_topic_id != 1:
+        kwargs["reply_to"] = dest_topic_id
+    async for msg in client.iter_messages(entity, **kwargs):
+        if not isinstance(msg, types.MessageService):
+            return True
+    return False
+
+
+async def destino_parece_ter_copia(client, to_entity) -> bool:
+    if not await is_forum(client, to_entity):
+        return await destino_topico_tem_conteudo(client, to_entity, None)
+    topics = await listar_topicos(client, to_entity)
+    for topic in topics:
+        if topic.id == 1:
+            continue
+        if await destino_topico_tem_conteudo(client, to_entity, topic.id):
+            return True
+    return False
+
+
+async def obter_max_msg_id_origem(client, from_entity, source_topic_id, other_topic_ids):
+    max_id = 0
+    if source_topic_id is not None and source_topic_id != 1:
+        iterator = client.iter_messages(from_entity, reply_to=source_topic_id)
+    else:
+        iterator = client.iter_messages(from_entity)
+    async for msg in iterator:
+        if source_topic_id is not None:
+            if not _mensagem_no_topico(msg, source_topic_id, other_topic_ids):
+                continue
+        if isinstance(msg, types.MessageService):
+            continue
+        max_id = max(max_id, msg.id)
+    return max_id
+
+
+async def semear_sync_da_origem(client, from_entity, to_entity, sync_data):
+    pair_key = sync_pair_key(from_entity, to_entity)
+    topics = await listar_topicos(client, from_entity)
+    other_topic_ids = {t.id for t in topics if t.id != 1}
+    say("\n🌱 Semeando sync a partir da origem (sem copiar mensagens)…")
+
+    if not topics:
+        max_id = await obter_max_msg_id_origem(client, from_entity, 1, set())
+        registrar_topico_sync(sync_data, pair_key, 1, "Geral", max_id)
+        say(f"  Geral: último id registrado = {max_id}")
+    else:
+        for topic in topics:
+            title = topic.title or "Geral"
+            max_id = await obter_max_msg_id_origem(
+                client, from_entity, topic.id, other_topic_ids
+            )
+            registrar_topico_sync(sync_data, pair_key, topic.id, title, max_id)
+            say(f"  {title!r}: último id registrado = {max_id}")
+
+    save_sync(sync_data)
+    say("✅ Sync inicializado. Nas próximas execuções use modo incremental (s).")
+
+
 def first_time_setup(existing_cfg=None):
     cfg = existing_cfg or {}
-    print("\n=== Configuração inicial (será salva em cpgrupo_config.json) ===")
+    say("\n=== Configuração inicial (será salva em cpgrupo_config.json) ===")
 
     while True:
         v = input("Informe seu API ID (número criado em my.telegram.org): ").strip()
         if v.isdigit():
             cfg["api_id"] = int(v)
             break
-        print("API ID deve ser um número inteiro.")
+        say("API ID deve ser um número inteiro.")
 
     v = input("Informe seu API HASH (texto criado em my.telegram.org): ").strip()
     while not v or " " in v:
-        print("API HASH inválido (não use espaços).")
+        say("API HASH inválido (não use espaços).")
         v = input("Informe seu API HASH novamente: ").strip()
     cfg["api_hash"] = v
 
     save_config(cfg)
-    print("✅ Configuração salva em", CONFIG_FILE.name)
+    say("✅ Configuração salva em", CONFIG_FILE.name)
     return cfg
 
 
@@ -96,19 +331,44 @@ async def coletar_grupos(client):
     return grupos
 
 
+async def coletar_chats_privados(client):
+    """Lista chats privados (usuários) da conta."""
+    chats = []
+    async for dialog in client.iter_dialogs():
+        if not dialog.is_user:
+            continue
+        entity = dialog.entity
+        if isinstance(entity, types.User) and getattr(entity, "is_self", False):
+            continue
+        peer_id = utils.get_peer_id(entity)
+        nome = dialog.name or "Sem nome"
+        username = getattr(entity, "username", None)
+        chats.append(
+            {
+                "peer_id": peer_id,
+                "nome": nome,
+                "username": username,
+                "tipo": "Privado",
+                "entity": entity,
+            }
+        )
+    chats.sort(key=lambda item: item["nome"].casefold())
+    return chats
+
+
 def exibir_grupos(grupos):
     if not grupos:
-        print("\nNenhum grupo encontrado na sua conta.")
+        say("\nNenhum grupo encontrado na sua conta.")
         return
 
-    print(f"\n{'─' * 76}")
-    print(f"{'#':>3}  {'ID':<20}  {'Tipo':<8}  Nome")
-    print(f"{'─' * 76}")
+    say(f"\n{'─' * 76}")
+    say(f"{'#':>3}  {'ID':<20}  {'Tipo':<8}  Nome")
+    say(f"{'─' * 76}")
     for indice, grupo in enumerate(grupos, 1):
-        print(f"{indice:>3}  {grupo['peer_id']:<20}  {grupo['tipo']:<8}  {grupo['nome']}")
-    print(f"{'─' * 76}")
-    print(f"Total: {len(grupos)} grupo(s)")
-    print("Use o número (#), o ID (-100...) ou o nome exato para selecionar.\n")
+        say(f"{indice:>3}  {grupo['peer_id']:<20}  {grupo['tipo']:<8}  {grupo['nome']}")
+    say(f"{'─' * 76}")
+    say(f"Total: {len(grupos)} grupo(s)")
+    say("Use o número (#), o ID (-100...) ou o nome exato para selecionar.\n")
 
 
 LISTAR_COMANDOS = {"listar", "lista", "?", "l"}
@@ -126,14 +386,14 @@ async def solicitar_grupo(client, titulo: str, grupos=None, permitir_vazio=False
             if permitir_vazio and valor_vazio is not None:
                 return await client.get_entity(valor_vazio)
             if grupos is None:
-                print("Carregando grupos…")
+                say("Carregando grupos…")
                 grupos = await coletar_grupos(client)
             exibir_grupos(grupos)
             continue
 
         if entrada.lower() in LISTAR_COMANDOS:
             if grupos is None:
-                print("Carregando grupos…")
+                say("Carregando grupos…")
                 grupos = await coletar_grupos(client)
             exibir_grupos(grupos)
             continue
@@ -142,18 +402,18 @@ async def solicitar_grupo(client, titulo: str, grupos=None, permitir_vazio=False
             indice = int(entrada)
             if 1 <= indice <= len(grupos):
                 escolhido = grupos[indice - 1]
-                print(f"Selecionado: {escolhido['nome']} ({escolhido['peer_id']})")
+                say(f"Selecionado: {escolhido['nome']} ({escolhido['peer_id']})")
                 return escolhido["entity"]
 
         try:
             entity = await resolve_entity(client, entrada)
             peer_id = utils.get_peer_id(entity)
             nome = getattr(entity, "title", None) or getattr(entity, "first_name", entrada)
-            print(f"Selecionado: {nome} ({peer_id})")
+            say(f"Selecionado: {nome} ({peer_id})")
             return entity
         except Exception as exc:
-            print(f"❌ Não encontrado: {exc}")
-            print("Digite 'listar' para ver todos os grupos com ID.")
+            say(f"❌ Não encontrado: {exc}")
+            say("Digite 'listar' para ver todos os grupos com ID.")
 
 
 async def is_forum(client, entity) -> bool:
@@ -170,8 +430,14 @@ async def is_forum(client, entity) -> bool:
 async def ensure_forum_enabled(client, entity):
     if await is_forum(client, entity):
         return entity
-    print("⚙️ Ativando tópicos no grupo de destino…")
-    await client(functions.channels.ToggleForumRequest(channel=entity, enabled=True))
+    say("⚙️ Ativando tópicos no grupo de destino…")
+    await client(
+        functions.channels.ToggleForumRequest(
+            channel=entity,
+            enabled=True,
+            tabs=False,
+        )
+    )
     return await client.get_entity(entity)
 
 
@@ -189,8 +455,8 @@ async def criar_supergrupo_forum(client, title: str, about: str = ""):
         raise RuntimeError("Não foi possível criar o supergrupo.")
     entity = await client.get_entity(channel)
     peer_id = utils.get_peer_id(entity)
-    print(f"✅ Supergrupo criado: {title!r}")
-    print(f"   ID: {peer_id}")
+    say(f"✅ Supergrupo criado: {title!r}")
+    say(f"   ID: {peer_id}")
     return entity
 
 
@@ -224,7 +490,7 @@ async def resolver_destino_interativo(client, cfg, origem_entity, grupos=None):
             save_config(cfg)
             return await ensure_forum_enabled(client, entity)
 
-        print("Responda s ou n.")
+        say("Responda s ou n.")
 
 
 async def listar_topicos(client, channel):
@@ -326,7 +592,7 @@ async def criar_topico(
                 )
             )
         except Exception as e:
-            print(f"  ⚠️ Não foi possível fechar o tópico {title!r}: {e}")
+            say(f"  ⚠️ Não foi possível fechar o tópico {title!r}: {e}")
 
     return topic_id
 
@@ -380,7 +646,7 @@ async def preparar_topico_destino(client, to_entity, source_topic, dest_topics_b
                     )
                 )
             except Exception as e:
-                print(f"  ⚠️ Não foi possível renomear o tópico Geral: {e}")
+                say(f"  ⚠️ Não foi possível renomear o tópico Geral: {e}")
 
         if closed:
             try:
@@ -392,13 +658,13 @@ async def preparar_topico_destino(client, to_entity, source_topic, dest_topics_b
                     )
                 )
             except Exception as e:
-                print(f"  ⚠️ Não foi possível fechar o tópico Geral: {e}")
+                say(f"  ⚠️ Não foi possível fechar o tópico Geral: {e}")
 
         return None
 
     existing = await buscar_topico_por_titulo(client, to_entity, title)
     if existing:
-        print(f"  ↪ Tópico já existe no destino, reutilizando: {title!r}")
+        say(f"  ↪ Tópico já existe no destino, reutilizando: {title!r}")
         return existing.id
 
     return await criar_topico(
@@ -425,6 +691,82 @@ async def encaminhar_lote(client, from_entity, to_entity, ids_buffer, top_msg_id
     await client(functions.messages.ForwardMessagesRequest(**kwargs))
 
 
+def _formatar_duracao(total_segundos: int) -> str:
+    horas, resto = divmod(max(0, total_segundos), 3600)
+    minutos, segundos = divmod(resto, 60)
+    if horas:
+        return f"{horas:02d}:{minutos:02d}:{segundos:02d}"
+    return f"{minutos:02d}:{segundos:02d}"
+
+
+def _segundos_flood(exc) -> int:
+    seconds = getattr(exc, "seconds", None)
+    if seconds:
+        return int(seconds)
+    match = re.search(r"wait of (\d+) seconds", str(exc), re.IGNORECASE)
+    if match:
+        return int(match.group(1))
+    return 60
+
+
+async def aguardar_flood(exc):
+    seconds = _segundos_flood(exc)
+    inicio = datetime.now()
+    fim = inicio + timedelta(seconds=seconds + 1)
+
+    say("\n  ═══════════════════════════════════════")
+    say("  ⏳ FLOODWAIT — limite temporário do Telegram")
+    say(f"  🕐 Início da pausa:  {inicio.strftime('%d/%m/%Y %H:%M:%S')}")
+    say(f"  🕑 Retomada prevista: {fim.strftime('%d/%m/%Y %H:%M:%S')}")
+    say(f"  ⏱️  Duração total:    {_formatar_duracao(seconds)} ({seconds}s)")
+    say("  💡 Não feche o terminal — o script continua sozinho.")
+    say("  ═══════════════════════════════════════\n")
+
+    await emit_event({
+        "type": "flood_start",
+        "total": seconds,
+        "remaining": seconds + 1,
+        "start": inicio.strftime("%d/%m/%Y %H:%M:%S"),
+        "end": fim.strftime("%d/%m/%Y %H:%M:%S"),
+        "end_time": fim.strftime("%H:%M:%S"),
+    })
+
+    restante = seconds + 1
+    while restante > 0:
+        linha = (
+            f"  ⏳ Aguardando... faltam {_formatar_duracao(restante)} "
+            f"| retoma às {fim.strftime('%H:%M:%S')}"
+        )
+        print(f"\r{linha:<72}", end="", flush=True)
+        await emit_event({
+            "type": "flood_tick",
+            "total": seconds,
+            "remaining": restante,
+            "end": fim.strftime("%d/%m/%Y %H:%M:%S"),
+            "end_time": fim.strftime("%H:%M:%S"),
+            "start": inicio.strftime("%d/%m/%Y %H:%M:%S"),
+        })
+        await asyncio.sleep(1)
+        restante -= 1
+
+    say("\r  ✅ Pausa concluída. Retomando cópia…" + " " * 40)
+    await emit_event({"type": "flood_end"})
+
+
+async def encaminhar_com_retry(client, from_entity, to_entity, ids_buffer, top_msg_id):
+    while True:
+        try:
+            await encaminhar_lote(client, from_entity, to_entity, ids_buffer, top_msg_id)
+            return
+        except FloodWaitError as exc:
+            await aguardar_flood(exc)
+        except RPCError as exc:
+            if "wait" in str(exc).lower() and "seconds" in str(exc).lower():
+                await aguardar_flood(exc)
+            else:
+                raise
+
+
 async def copiar_mensagens_topico(
     client,
     from_entity,
@@ -432,8 +774,10 @@ async def copiar_mensagens_topico(
     source_topic_id,
     dest_top_id,
     other_topic_ids=None,
+    min_msg_id=0,
 ):
     total = 0
+    max_copied_id = min_msg_id
     ids_buffer = []
     other_topic_ids = other_topic_ids or set()
 
@@ -444,99 +788,153 @@ async def copiar_mensagens_topico(
     else:
         message_iter = client.iter_messages(from_entity, reverse=True)
 
+    async def enviar_buffer():
+        nonlocal total, max_copied_id, ids_buffer
+        if not ids_buffer:
+            return
+        lote = ids_buffer[:]
+        await encaminhar_com_retry(client, from_entity, to_entity, lote, dest_top_id)
+        total += len(lote)
+        max_copied_id = max(max_copied_id, max(lote))
+        say(f"  {total} mensagens encaminhadas…")
+        ids_buffer.clear()
+        await asyncio.sleep(SLEEP_BETWEEN)
+
     async for msg in message_iter:
+        if isinstance(msg, types.MessageService):
+            continue
         if source_topic_id is not None:
             if not _mensagem_no_topico(msg, source_topic_id, other_topic_ids):
                 continue
+        if msg.id <= min_msg_id:
+            continue
+
         ids_buffer.append(msg.id)
         if len(ids_buffer) < BATCH_SIZE:
             continue
 
         try:
-            await encaminhar_lote(client, from_entity, to_entity, ids_buffer, dest_top_id)
-            total += len(ids_buffer)
-            print(f"  {total} mensagens encaminhadas…")
-            ids_buffer.clear()
-            await asyncio.sleep(SLEEP_BETWEEN)
-        except FloodWaitError as e:
-            print(f"  FloodWait: aguardando {e.seconds}s")
-            await asyncio.sleep(e.seconds + 1)
+            await enviar_buffer()
         except Exception as e:
-            print(f"  Erro em lote -> {e}")
-            for mid in ids_buffer:
+            say(f"  Erro em lote -> {e}")
+            for mid in ids_buffer[:]:
                 try:
-                    await encaminhar_lote(client, from_entity, to_entity, [mid], dest_top_id)
+                    await encaminhar_com_retry(
+                        client, from_entity, to_entity, [mid], dest_top_id
+                    )
                     total += 1
+                    max_copied_id = max(max_copied_id, mid)
                 except Exception as e2:
-                    print(f"  Erro id {mid} -> {e2}")
+                    say(f"  Erro id {mid} -> {e2}")
             ids_buffer.clear()
 
     if ids_buffer:
         try:
-            await encaminhar_lote(client, from_entity, to_entity, ids_buffer, dest_top_id)
-            total += len(ids_buffer)
-            print(f"  {total} mensagens encaminhadas…")
+            await enviar_buffer()
         except Exception as e:
-            print(f"  Erro no envio final -> {e}")
+            say(f"  Erro no envio final -> {e}")
+            for mid in ids_buffer[:]:
+                try:
+                    await encaminhar_com_retry(
+                        client, from_entity, to_entity, [mid], dest_top_id
+                    )
+                    total += 1
+                    max_copied_id = max(max_copied_id, mid)
+                except Exception as e2:
+                    say(f"  Erro id {mid} -> {e2}")
 
-    return total
+    return total, max_copied_id
 
 
-async def copiar_comunidade_forum(client, from_entity, to_entity):
+async def copiar_comunidade_forum(client, from_entity, to_entity, incremental=False, sync_data=None):
+    sync_data = sync_data if sync_data is not None else load_sync()
+    pair_key = sync_pair_key(from_entity, to_entity)
     to_entity = await ensure_forum_enabled(client, to_entity)
     topics = await listar_topicos(client, from_entity)
 
     if not topics:
-        print("⚠️ Nenhum tópico encontrado na origem. Copiando mensagens no tópico Geral…")
-        dest_topics = await listar_topicos(client, to_entity)
-        dest_general = next((t for t in dest_topics if t.id == 1), None)
-        if dest_general is None:
-            raise RuntimeError("Tópico Geral não encontrado no destino.")
-        total = await copiar_mensagens_topico(
-            client, from_entity, to_entity, 1, None, set()
+        say("⚠️ Nenhum tópico encontrado na origem. Copiando mensagens no tópico Geral…")
+        title = "Geral"
+        min_id = obter_ultimo_id_topico(sync_data, pair_key, 1, title) if incremental else 0
+        if incremental and min_id:
+            say(f"  Última mensagem copiada: id {min_id}")
+        elif incremental and min_id == 0 and await destino_topico_tem_conteudo(client, to_entity, None):
+            say("  ⚠️ Destino já tem mensagens sem histórico de sync. Pulando para evitar duplicatas.")
+            say("  Use a opção 'semear sync' na próxima execução.")
+            return
+        total, max_id = await copiar_mensagens_topico(
+            client, from_entity, to_entity, 1, None, set(), min_msg_id=min_id
         )
-        print(f"\n✅ Cópia concluída. Total: {total} mensagem(ns)\n")
+        registrar_topico_sync(sync_data, pair_key, 1, title, max_id)
+        save_sync(sync_data)
+        if total == 0 and incremental:
+            say("  Nenhuma mensagem nova.")
+        say(f"\n✅ Cópia concluída. Total: {total} mensagem(ns)\n")
         return
 
     dest_topics = await listar_topicos(client, to_entity)
     dest_topics_by_id = {t.id: t for t in dest_topics}
     other_topic_ids = {t.id for t in topics if t.id != 1}
 
-    print(f"\n📋 {len(topics)} tópico(s) encontrado(s) na origem.")
+    say(f"\n📋 {len(topics)} tópico(s) encontrado(s) na origem.")
+    if incremental:
+        say("🔄 Modo incremental: copiando apenas mensagens novas por tópico.")
     grand_total = 0
 
     for index, topic in enumerate(topics, 1):
         title = topic.title or "Geral"
-        print(f"\n[{index}/{len(topics)}] Tópico: {title!r}")
+        say(f"\n[{index}/{len(topics)}] Tópico: {title!r}")
+
+        min_id = obter_ultimo_id_topico(sync_data, pair_key, topic.id, title) if incremental else 0
+        if incremental and min_id:
+            say(f"  Última mensagem copiada: id {min_id}")
 
         try:
             dest_top_id = await preparar_topico_destino(
                 client, to_entity, topic, dest_topics_by_id
             )
-            print(f"  top_msg_id destino = {dest_top_id!r}")
+            say(f"  top_msg_id destino = {dest_top_id!r}")
         except ChatAdminRequiredError:
-            print("  ⚠️ Sem permissão para criar/editar tópicos. Pulando.")
+            say("  ⚠️ Sem permissão para criar/editar tópicos. Pulando.")
             continue
         except Exception as e:
-            print(f"  ❌ Erro ao preparar tópico: {e}")
+            say(f"  ❌ Erro ao preparar tópico: {e}")
             continue
 
-        print("  Iniciando cópia…")
+        if incremental and min_id == 0:
+            tem_conteudo = await destino_topico_tem_conteudo(
+                client, to_entity, dest_top_id if topic.id != 1 else None
+            )
+            if tem_conteudo:
+                say("  ⚠️ Tópico já tem mensagens no destino sem histórico de sync.")
+                say("  Pulando para evitar duplicatas. Use 'semear sync' na próxima execução.")
+                continue
+
+        say("  Iniciando cópia…")
         try:
-            total = await copiar_mensagens_topico(
+            total, max_id = await copiar_mensagens_topico(
                 client,
                 from_entity,
                 to_entity,
                 topic.id,
                 dest_top_id,
                 other_topic_ids,
+                min_msg_id=min_id,
             )
+            registrar_topico_sync(sync_data, pair_key, topic.id, title, max_id)
+            save_sync(sync_data)
             grand_total += total
-            print(f"  ✅ Tópico concluído: {total} mensagem(ns)")
+            if total == 0 and incremental:
+                say("  Nenhuma mensagem nova.")
+            else:
+                say(f"  ✅ Tópico concluído: {total} mensagem(ns)")
         except Exception as e:
-            print(f"  ❌ Erro ao copiar tópico: {e}")
+            say(f"  ❌ Erro ao copiar tópico: {e}")
 
-    print(f"\n✅ Comunidade clonada. Total geral: {grand_total} mensagem(ns)\n")
+        if index < len(topics):
+            await asyncio.sleep(PAUSA_ENTRE_TOPICOS)
+
+    say(f"\n✅ Comunidade sincronizada. Total geral: {grand_total} mensagem(ns)\n")
 
 
 async def get_or_create_topic(client, channel, title: str) -> int:
@@ -546,46 +944,223 @@ async def get_or_create_topic(client, channel, title: str) -> int:
     return await criar_topico(client, channel, title)
 
 
-async def copiar_grupo_simples(client, from_entity, to_entity):
+async def copiar_grupo_simples(
+    client, from_entity, to_entity, incremental=False, sync_data=None
+):
+    sync_data = sync_data if sync_data is not None else load_sync()
+    pair_key = sync_pair_key(from_entity, to_entity)
     origem_title = getattr(from_entity, "title", None) or getattr(
         from_entity, "first_name", "Origem"
     )
     topic_title = origem_title[:128]
-    print(f"Tópico no destino: {topic_title!r}")
+    say(f"Tópico no destino: {topic_title!r}")
 
     try:
         to_entity = await ensure_forum_enabled(client, to_entity)
         top_msg_id = await get_or_create_topic(client, to_entity, topic_title)
-        print(f"top_msg_id = {top_msg_id}")
+        say(f"top_msg_id = {top_msg_id}")
     except ChatAdminRequiredError:
-        print("⚠️ Sem permissão para criar tópicos no destino. Encaminhando SEM tópico.")
+        say("⚠️ Sem permissão para criar tópicos no destino. Encaminhando SEM tópico.")
         top_msg_id = None
 
-    print("Iniciando cópia…")
-    total = await copiar_mensagens_topico(
-        client, from_entity, to_entity, None, top_msg_id
+    min_id = obter_ultimo_id_topico(sync_data, pair_key, 0, topic_title) if incremental else 0
+    if incremental and min_id:
+        say(f"Última mensagem copiada: id {min_id}")
+        say("🔄 Modo incremental: copiando apenas mensagens novas.")
+    elif incremental and min_id == 0 and await destino_topico_tem_conteudo(client, to_entity, top_msg_id):
+        say("⚠️ Destino já tem mensagens sem histórico de sync. Pulando para evitar duplicatas.")
+        return
+
+    say("Iniciando cópia…")
+    total, max_id = await copiar_mensagens_topico(
+        client, from_entity, to_entity, None, top_msg_id, min_msg_id=min_id
     )
-    print(f"✅ Encaminhamento concluído. Total: {total}\n")
+    registrar_topico_sync(sync_data, pair_key, 0, topic_title, max_id)
+    save_sync(sync_data)
+    if total == 0 and incremental:
+        say("Nenhuma mensagem nova.")
+    say(f"✅ Encaminhamento concluído. Total: {total}\n")
 
 
-async def copiar_origem(client, from_entity, to_entity):
+async def copiar_privado_para_topico(
+    client,
+    from_entity,
+    to_entity,
+    dest_topic_id: int,
+    modo_mensagens: str = "received",
+    incremental: bool = False,
+    sync_data=None,
+):
+    """
+    Clona mensagens de um chat privado para um tópico específico do destino.
+    modo_mensagens: "received" (somente recebidas) ou "all" (todas).
+    """
+    if modo_mensagens not in {"received", "all"}:
+        raise ValueError("modo_mensagens inválido. Use 'received' ou 'all'.")
+
+    sync_data = sync_data if sync_data is not None else load_sync()
+    pair_key = f"{sync_pair_key(from_entity, to_entity)}:{int(dest_topic_id)}"
+    source_name = getattr(from_entity, "first_name", None) or getattr(
+        from_entity, "title", "Privado"
+    )
+    mode_label = "somente recebidas" if modo_mensagens == "received" else "todas"
+    say(f"💬 Origem privada: {source_name!r} | filtro: {mode_label}")
+
+    min_id = (
+        obter_ultimo_id_topico(sync_data, pair_key, 0, "privado_to_topic")
+        if incremental
+        else 0
+    )
+    if incremental and min_id:
+        say(f"Última mensagem copiada: id {min_id}")
+        say("🔄 Modo incremental: copiando apenas mensagens novas.")
+    elif incremental and min_id == 0 and await destino_topico_tem_conteudo(
+        client, to_entity, dest_topic_id
+    ):
+        say("⚠️ Tópico destino já tem mensagens sem histórico de sync. Pulando para evitar duplicatas.")
+        return
+
+    total = 0
+    max_copied_id = min_id
+    ids_buffer = []
+
+    async def enviar_buffer():
+        nonlocal total, max_copied_id, ids_buffer
+        if not ids_buffer:
+            return
+        lote = ids_buffer[:]
+        await encaminhar_com_retry(client, from_entity, to_entity, lote, dest_topic_id)
+        total += len(lote)
+        max_copied_id = max(max_copied_id, max(lote))
+        say(f"  {total} mensagens encaminhadas…")
+        ids_buffer.clear()
+        await asyncio.sleep(SLEEP_BETWEEN)
+
+    async for msg in client.iter_messages(from_entity, reverse=True):
+        if isinstance(msg, types.MessageService):
+            continue
+        if msg.id <= min_id:
+            continue
+        if modo_mensagens == "received" and getattr(msg, "out", False):
+            continue
+        ids_buffer.append(msg.id)
+        if len(ids_buffer) >= BATCH_SIZE:
+            try:
+                await enviar_buffer()
+            except Exception as e:
+                say(f"  Erro em lote -> {e}")
+                for mid in ids_buffer[:]:
+                    try:
+                        await encaminhar_com_retry(
+                            client, from_entity, to_entity, [mid], dest_topic_id
+                        )
+                        total += 1
+                        max_copied_id = max(max_copied_id, mid)
+                    except Exception as e2:
+                        say(f"  Erro id {mid} -> {e2}")
+                ids_buffer.clear()
+
+    if ids_buffer:
+        try:
+            await enviar_buffer()
+        except Exception as e:
+            say(f"  Erro no envio final -> {e}")
+            for mid in ids_buffer[:]:
+                try:
+                    await encaminhar_com_retry(
+                        client, from_entity, to_entity, [mid], dest_topic_id
+                    )
+                    total += 1
+                    max_copied_id = max(max_copied_id, mid)
+                except Exception as e2:
+                    say(f"  Erro id {mid} -> {e2}")
+
+    registrar_topico_sync(sync_data, pair_key, 0, "privado_to_topic", max_copied_id)
+    save_sync(sync_data)
+    if total == 0 and incremental:
+        say("Nenhuma mensagem nova.")
+    say(f"✅ Encaminhamento privado concluído. Total: {total}\n")
+
+
+async def copiar_origem(client, from_entity, to_entity, mode="full", skip_confirm_rebuild=False):
+    sync_data = load_sync()
+    pair_key = sync_pair_key(from_entity, to_entity)
+
+    if mode == "seed":
+        await semear_sync_da_origem(client, from_entity, to_entity, sync_data)
+        return
+
+    if mode == "rebuild":
+        nome_destino = getattr(to_entity, "title", None) or "destino"
+        if not skip_confirm_rebuild and not confirmar_recomeco(nome_destino):
+            say("Operação cancelada.")
+            return
+        await apagar_todos_topicos_destino(client, to_entity)
+        limpar_sync_par(sync_data, pair_key)
+        mode = "full"
+
+    incremental = mode == "incremental"
     if await is_forum(client, from_entity):
-        print("📂 Origem detectada como comunidade com tópicos.")
-        await copiar_comunidade_forum(client, from_entity, to_entity)
+        say("📂 Origem detectada como comunidade com tópicos.")
+        await copiar_comunidade_forum(
+            client, from_entity, to_entity, incremental=incremental, sync_data=sync_data
+        )
     else:
-        print("💬 Origem detectada como grupo/chat simples.")
-        await copiar_grupo_simples(client, from_entity, to_entity)
+        say("💬 Origem detectada como grupo/chat simples.")
+        await copiar_grupo_simples(
+            client, from_entity, to_entity, incremental=incremental, sync_data=sync_data
+        )
 
 
-async def main(reset=False):
+async def executar_copia(
+    client,
+    cfg,
+    origem_peer_id: int,
+    mode: str = "incremental",
+    destino_peer_id=None,
+    criar_destino: bool = False,
+    destino_nome: str = "",
+    destino_about: str = "",
+    skip_confirm_rebuild: bool = False,
+):
+    from_entity = await client.get_entity(origem_peer_id)
+    if criar_destino:
+        nome = destino_nome.strip() or f"{getattr(from_entity, 'title', 'Grupo')} (Cópia)"
+        to_entity = await criar_supergrupo_forum(client, nome[:128], destino_about)
+        cfg["destino_id"] = utils.get_peer_id(to_entity)
+        save_config(cfg)
+    else:
+        if destino_peer_id is None:
+            raise ValueError("Informe o grupo de destino.")
+        to_entity = await ensure_forum_enabled(client, await client.get_entity(destino_peer_id))
+        cfg["destino_id"] = utils.get_peer_id(to_entity)
+        save_config(cfg)
+
+    if mode == "cancel":
+        return
+
+    await copiar_origem(
+        client,
+        from_entity,
+        to_entity,
+        mode=mode,
+        skip_confirm_rebuild=skip_confirm_rebuild,
+    )
+
+
+async def main(reset=False, reset_sync=False):
+    if reset_sync and SYNC_FILE.exists():
+        SYNC_FILE.unlink()
+        say("✅ Histórico de sync apagado (cpgrupo_sync.json).")
+
     cfg = ensure_config(reset=reset)
     api_id = cfg["api_id"]
     api_hash = cfg["api_hash"]
 
     async with TelegramClient(SESSION_NAME, api_id, api_hash) as client:
         me = await client.get_me()
-        print("\nConectado como", me.username or me.first_name)
-        print("Dica: pressione Enter ou digite 'listar' para ver seus grupos com ID.")
+        say("\nConectado como", me.username or me.first_name)
+        say("Dica: pressione Enter ou digite 'listar' para ver seus grupos com ID.")
 
         while True:
             try:
@@ -597,13 +1172,20 @@ async def main(reset=False):
                     grupos=grupos,
                 )
                 to_entity = await resolver_destino_interativo(client, cfg, from_entity, grupos)
-                await copiar_origem(client, from_entity, to_entity)
+                sync_data = load_sync()
+                pair_key = sync_pair_key(from_entity, to_entity)
+                destino_tem_conteudo = await destino_parece_ter_copia(client, to_entity)
+                mode = solicitar_modo_sincronizacao(sync_data, pair_key, destino_tem_conteudo)
+                if mode == "cancel":
+                    say("Operação cancelada.")
+                    continue
+                await copiar_origem(client, from_entity, to_entity, mode=mode)
             except Exception as e:
-                print(f"❌ Erro ao copiar: {e}")
+                say(f"❌ Erro ao copiar: {e}")
 
             repetir = input("\nDeseja copiar outro grupo? (s/n): ").strip().lower()
             if repetir != "s":
-                print("Encerrando execução. 👋")
+                say("Encerrando execução. 👋")
                 break
 
 
@@ -616,5 +1198,30 @@ if __name__ == "__main__":
         action="store_true",
         help="Refazer configuração (API ID/HASH).",
     )
+    parser.add_argument(
+        "--reset-sync",
+        action="store_true",
+        help="Apagar histórico de sincronização incremental (cpgrupo_sync.json).",
+    )
+    parser.add_argument(
+        "--web",
+        action="store_true",
+        help="Iniciar interface web no navegador.",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=WEB_PORT,
+        help=f"Porta da interface web (padrão: {WEB_PORT}).",
+    )
     args = parser.parse_args()
-    asyncio.run(main(reset=args.reset))
+
+    if args.web:
+        import os
+        import uvicorn
+
+        os.environ["CPGRUPO_WEB_PORT"] = str(args.port)
+        say(f"Iniciando interface web em http://127.0.0.1:{args.port}")
+        uvicorn.run("web_server:app", host="127.0.0.1", port=args.port, log_level="warning")
+    else:
+        asyncio.run(main(reset=args.reset, reset_sync=args.reset_sync))
