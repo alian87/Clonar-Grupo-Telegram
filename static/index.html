@@ -165,6 +165,22 @@
       display: grid;
       gap: 1.5rem;
     }
+    .tabs {
+      display: flex;
+      gap: 0.6rem;
+      flex-wrap: wrap;
+      margin-bottom: 0.4rem;
+    }
+    .tab-btn {
+      background: var(--surface2);
+      color: var(--text-secondary);
+      border: 1px solid var(--border);
+    }
+    .tab-btn.active {
+      background: var(--accent);
+      color: #fff;
+      border-color: transparent;
+    }
     .grid-2 {
       display: grid;
       grid-template-columns: 1.15fr 0.85fr;
@@ -487,6 +503,34 @@
       line-height: 1.55;
     }
     .hint strong { color: var(--text-secondary); font-weight: 500; }
+    .help-box {
+      margin: 0 0 1.25rem;
+      padding: 1rem 1.1rem;
+      border-radius: var(--radius);
+      background: var(--bg-elevated);
+      border: 1px solid var(--border);
+      font-size: 0.85rem;
+      color: var(--muted);
+      line-height: 1.6;
+    }
+    .help-box summary {
+      cursor: pointer;
+      color: var(--text-secondary);
+      font-weight: 600;
+      list-style: none;
+    }
+    .help-box summary::-webkit-details-marker { display: none; }
+    .help-box summary::before {
+      content: "▸ ";
+      color: var(--accent);
+    }
+    .help-box[open] summary::before { content: "▾ "; }
+    .help-box ul {
+      margin: 0.75rem 0 0;
+      padding-left: 1.25rem;
+    }
+    .help-box li { margin-bottom: 0.35rem; }
+    .help-box li strong { color: var(--text-secondary); font-weight: 500; }
     .actions { margin-top: 1.25rem; }
     .actions button { width: 100%; padding: 0.85rem; font-size: 0.95rem; }
     #rebuild-confirm { margin-top: 0.75rem; }
@@ -531,6 +575,11 @@
   </header>
 
   <main id="conteudo">
+    <div id="sec-tabs" class="tabs hidden">
+      <button type="button" id="tab-btn-groups" class="tab-btn active">Clonar grupos</button>
+      <button type="button" id="tab-btn-private" class="tab-btn">Privado → tópico</button>
+    </div>
+
     <section id="sec-config" class="panel hidden">
       <h2>Configuração da API</h2>
       <p class="section-desc">Obtenha suas credenciais em <a href="https://my.telegram.org" target="_blank" rel="noopener">my.telegram.org</a> → API Development Tools.</p>
@@ -564,6 +613,7 @@
       </div>
     </section>
 
+    <div id="tab-groups" class="hidden">
     <div class="grid-2 hidden" id="sec-main">
       <section class="panel panel-accent">
         <h2>Grupos</h2>
@@ -670,6 +720,57 @@
         <textarea id="sync-json" spellcheck="false"></textarea>
       </div>
     </section>
+    </div>
+
+    <section id="tab-private" class="panel hidden">
+      <h2>Clonar privado para tópico</h2>
+      <p class="section-desc">Copia mensagens de uma conversa privada para um tópico específico de um supergrupo (fórum).</p>
+      <details class="help-box">
+        <summary>O que conta como mensagem recebida?</summary>
+        <ul>
+          <li><strong>Apenas recebidas</strong> — copia somente mensagens que a outra pessoa enviou para você no privado (texto, foto, vídeo, áudio, documento, sticker, etc.).</li>
+          <li><strong>Todas</strong> — inclui também as mensagens que você enviou na mesma conversa.</li>
+          <li><strong>Encaminhadas</strong> — se alguém te enviou uma mensagem encaminhada no privado, ela entra como <em>recebida</em> (o conteúdo é copiado; o autor original continua oculto no destino, como nas outras cópias).</li>
+          <li><strong>Não são copiadas</strong> — avisos de serviço do Telegram (ex.: “fulano entrou”, “mensagem apagada”, “fixou mensagem”).</li>
+          <li><strong>Incremental</strong> — nas próximas execuções, copia só mensagens novas desde a última cópia deste par (chat + grupo + tópico + filtro escolhido).</li>
+        </ul>
+      </details>
+      <div class="row">
+        <div>
+          <label for="private-chat-select">Chat privado (origem)</label>
+          <select id="private-chat-select"></select>
+        </div>
+        <div>
+          <label for="private-dest-group-select">Supergrupo destino</label>
+          <select id="private-dest-group-select"></select>
+        </div>
+      </div>
+      <div class="row">
+        <div>
+          <label for="private-topic-select">Tópico do destino</label>
+          <select id="private-topic-select"></select>
+        </div>
+        <div>
+          <label for="private-filter">Mensagens a clonar</label>
+          <select id="private-filter">
+            <option value="received">Apenas recebidas</option>
+            <option value="all">Todas (recebidas + enviadas)</option>
+          </select>
+        </div>
+      </div>
+      <div class="row">
+        <div>
+          <label for="private-mode">Modo</label>
+          <select id="private-mode">
+            <option value="full">Primeira cópia (completa)</option>
+            <option value="incremental">Incremental (somente novas)</option>
+          </select>
+        </div>
+      </div>
+      <div class="actions">
+        <button type="button" id="btn-start-private" disabled>Iniciar cópia do privado</button>
+      </div>
+    </section>
 
     <section id="sec-log" class="panel">
       <h2>Log em tempo real</h2>
@@ -706,6 +807,7 @@
     let jobRunning = false;
     let ws = null;
     let syncData = { pairs: {} };
+    let activeTab = "groups";
 
     function appendLog(msg) {
       const line = document.createElement("div");
@@ -758,6 +860,25 @@
       $("#btn-start").disabled = !can;
     }
 
+    function updatePrivateStartButton() {
+      const can =
+        $("#private-chat-select").value &&
+        $("#private-dest-group-select").value &&
+        $("#private-topic-select").value &&
+        !jobRunning;
+      $("#btn-start-private").disabled = !can;
+    }
+
+    function resetPrivateTopicSelect(message = "Selecione um supergrupo destino") {
+      const topicSel = $("#private-topic-select");
+      topicSel.innerHTML = "";
+      const op = document.createElement("option");
+      op.value = "";
+      op.textContent = message;
+      topicSel.appendChild(op);
+      updatePrivateStartButton();
+    }
+
     async function api(path, opts = {}) {
       const res = await fetch(path, {
         headers: { "Content-Type": "application/json" },
@@ -782,6 +903,9 @@
       if (!st.has_config) {
         $("#sec-config").classList.remove("hidden");
         $("#sec-auth").classList.add("hidden");
+        $("#sec-tabs").classList.add("hidden");
+        $("#tab-groups").classList.add("hidden");
+        $("#tab-private").classList.add("hidden");
         $("#sec-main").classList.add("hidden");
         $("#sec-sync").classList.add("hidden");
         setStatus("Configure API ID e HASH", false);
@@ -791,21 +915,34 @@
 
       if (!st.connected) {
         $("#sec-auth").classList.remove("hidden");
+        $("#sec-tabs").classList.add("hidden");
+        $("#tab-groups").classList.add("hidden");
+        $("#tab-private").classList.add("hidden");
         $("#sec-main").classList.add("hidden");
         $("#sec-sync").classList.add("hidden");
         setStatus("Faça login no Telegram", false);
         return;
       }
       $("#sec-auth").classList.add("hidden");
+      $("#sec-tabs").classList.remove("hidden");
+      setActiveTab(activeTab);
       $("#sec-main").classList.remove("hidden");
       $("#sec-sync").classList.remove("hidden");
       setStatus(`Conectado: ${st.user || "ok"}`, true);
 
-      if (st.destino_id && !destinoId) {
-        destinoId = st.destino_id;
-      }
       await loadGroups();
+      await loadPrivateChats();
+      await loadPrivateDestGroups();
       await loadSync();
+    }
+
+    function setActiveTab(tab) {
+      activeTab = tab === "private" ? "private" : "groups";
+      const groupsOn = activeTab === "groups";
+      $("#tab-btn-groups").classList.toggle("active", groupsOn);
+      $("#tab-btn-private").classList.toggle("active", !groupsOn);
+      $("#tab-groups").classList.toggle("hidden", !groupsOn);
+      $("#tab-private").classList.toggle("hidden", groupsOn);
     }
 
     function getActivePairKey() {
@@ -1000,6 +1137,90 @@
       updateLabels();
     }
 
+    async function loadPrivateChats() {
+      const data = await api("/api/private-chats");
+      const select = $("#private-chat-select");
+      select.innerHTML = "";
+      const placeholder = document.createElement("option");
+      placeholder.value = "";
+      placeholder.textContent = "— Selecione um chat —";
+      select.appendChild(placeholder);
+      const chats = data.chats || [];
+      if (!chats.length) {
+        placeholder.textContent = "Nenhum chat privado encontrado";
+        updatePrivateStartButton();
+        return;
+      }
+      chats.forEach((chat) => {
+        const op = document.createElement("option");
+        op.value = chat.peer_id;
+        const user = chat.username ? ` (@${chat.username})` : "";
+        op.textContent = `${chat.nome}${user} [${chat.peer_id}]`;
+        select.appendChild(op);
+      });
+      updatePrivateStartButton();
+    }
+
+    async function loadPrivateDestGroups() {
+      const data = await api("/api/groups");
+      const select = $("#private-dest-group-select");
+      select.innerHTML = "";
+      const placeholder = document.createElement("option");
+      placeholder.value = "";
+      placeholder.textContent = "— Selecione um supergrupo —";
+      select.appendChild(placeholder);
+      const g = data.groups || [];
+      if (!g.length) {
+        placeholder.textContent = "Nenhum grupo encontrado";
+        resetPrivateTopicSelect("Nenhum grupo disponível");
+        return;
+      }
+      g.forEach((group) => {
+        const op = document.createElement("option");
+        op.value = group.peer_id;
+        op.textContent = `${group.nome} [${group.peer_id}]`;
+        select.appendChild(op);
+      });
+      resetPrivateTopicSelect();
+    }
+
+    async function loadDestinationTopicsForPrivate() {
+      const dest = $("#private-dest-group-select").value;
+      if (!dest) {
+        resetPrivateTopicSelect();
+        return;
+      }
+      const topicSel = $("#private-topic-select");
+      topicSel.innerHTML = "";
+      const loading = document.createElement("option");
+      loading.value = "";
+      loading.textContent = "Carregando tópicos…";
+      topicSel.appendChild(loading);
+      try {
+        const data = await api(`/api/destination-topics?destino_id=${encodeURIComponent(dest)}`);
+        const topics = data.topics || [];
+        topicSel.innerHTML = "";
+        if (!topics.length) {
+          resetPrivateTopicSelect("Nenhum tópico encontrado neste grupo");
+          return;
+        }
+        const placeholder = document.createElement("option");
+        placeholder.value = "";
+        placeholder.textContent = "— Selecione um tópico —";
+        topicSel.appendChild(placeholder);
+        topics.forEach((t) => {
+          const op = document.createElement("option");
+          op.value = t.id;
+          op.textContent = `${t.title} [${t.id}]`;
+          topicSel.appendChild(op);
+        });
+      } catch (e) {
+        resetPrivateTopicSelect("Não foi possível carregar tópicos");
+        appendLog("❌ Erro ao carregar tópicos do destino: " + e.message);
+      }
+      updatePrivateStartButton();
+    }
+
     function renderGroups() {
       document.querySelectorAll("#groups-body tr").forEach((tr, i) => {
         tr.classList.remove("selected-origin", "selected-dest", "selected-both");
@@ -1039,11 +1260,13 @@
         jobRunning = true;
         appendLog("——— Início da cópia ———");
         updateStartButton();
+        updatePrivateStartButton();
       }
       if (data.type === "job_done") {
         jobRunning = false;
         appendLog("——— Cópia concluída ———");
         updateStartButton();
+        updatePrivateStartButton();
         refreshStatus();
         loadSync();
       }
@@ -1051,6 +1274,7 @@
         jobRunning = false;
         appendLog("❌ Erro: " + (data.message || "desconhecido"));
         updateStartButton();
+        updatePrivateStartButton();
       }
       if (data.type === "flood_start") {
         floodBox.classList.remove("hidden");
@@ -1115,6 +1339,8 @@
     });
 
     $("#btn-refresh-groups").addEventListener("click", loadGroups);
+    $("#tab-btn-groups").addEventListener("click", () => setActiveTab("groups"));
+    $("#tab-btn-private").addEventListener("click", () => setActiveTab("private"));
 
     $("#chk-criar-destino").addEventListener("change", () => {
       const on = $("#chk-criar-destino").checked;
@@ -1174,6 +1400,42 @@
         appendLog("Cópia iniciada em segundo plano…");
         jobRunning = true;
         updateStartButton();
+      } catch (e) {
+        appendLog("❌ " + e.message);
+      }
+    });
+
+    $("#private-dest-group-select").addEventListener("change", loadDestinationTopicsForPrivate);
+    $("#private-chat-select").addEventListener("change", updatePrivateStartButton);
+    $("#private-topic-select").addEventListener("change", updatePrivateStartButton);
+
+    $("#btn-start-private").addEventListener("click", async () => {
+      const origemPrivadaId = $("#private-chat-select").value;
+      const destinoGroupId = $("#private-dest-group-select").value;
+      const destinoTopicId = $("#private-topic-select").value;
+      if (!origemPrivadaId || !destinoGroupId || !destinoTopicId) {
+        appendLog("❌ Selecione chat privado, grupo destino e tópico.");
+        return;
+      }
+      if (jobRunning) {
+        appendLog("❌ Já existe uma cópia em andamento.");
+        return;
+      }
+      try {
+        await api("/api/copy-private", {
+          method: "POST",
+          body: JSON.stringify({
+            origem_privada_id: parseInt(origemPrivadaId, 10),
+            destino_id: parseInt(destinoGroupId, 10),
+            destino_topic_id: parseInt(destinoTopicId, 10),
+            filtro: $("#private-filter").value,
+            mode: $("#private-mode").value,
+          }),
+        });
+        appendLog("Cópia de privado iniciada em segundo plano…");
+        jobRunning = true;
+        updateStartButton();
+        updatePrivateStartButton();
       } catch (e) {
         appendLog("❌ " + e.message);
       }

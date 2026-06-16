@@ -131,6 +131,45 @@ async def api_groups():
     }
 
 
+@app.get("/api/private-chats")
+async def api_private_chats():
+    client = await get_client()
+    chats = await cg.coletar_chats_privados(client)
+    return {
+        "chats": [
+            {k: v for k, v in chat.items() if k != "entity"} for chat in chats
+        ]
+    }
+
+
+@app.get("/api/destination-topics")
+async def api_destination_topics(destino_id: int):
+    client = await get_client()
+    try:
+        entity = await client.get_entity(destino_id)
+        if not await cg.is_forum(client, entity):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Este grupo não tem tópicos (fórum) ativados. "
+                    "Escolha um supergrupo com fórum em que você seja admin."
+                ),
+            )
+        topics = await cg.listar_topicos(client, entity)
+        return {
+            "topics": [
+                {"id": t.id, "title": t.title or "Geral"} for t in topics
+            ]
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Não foi possível listar tópicos do destino: {exc}",
+        ) from exc
+
+
 class ConfigIn(BaseModel):
     api_id: int
     api_hash: str
@@ -200,6 +239,14 @@ class CopyIn(BaseModel):
     confirm_rebuild: bool = False
 
 
+class PrivateCopyIn(BaseModel):
+    origem_privada_id: int
+    destino_id: int
+    destino_topic_id: int
+    mode: Literal["full", "incremental"] = "full"
+    filtro: Literal["received", "all"] = "received"
+
+
 @app.post("/api/copy")
 async def api_copy(body: CopyIn):
     if state.job_running:
@@ -231,6 +278,41 @@ async def api_copy(body: CopyIn):
         except Exception as exc:
             await broadcast({"type": "job_error", "message": str(exc)})
             cg.say(f"❌ Erro ao copiar: {exc}")
+        finally:
+            state.job_running = False
+            cg.set_event_sink(None)
+
+    asyncio.create_task(job())
+    return {"ok": True}
+
+
+@app.post("/api/copy-private")
+async def api_copy_private(body: PrivateCopyIn):
+    if state.job_running:
+        raise HTTPException(status_code=409, detail="Já existe uma cópia em andamento.")
+
+    async def job():
+        state.job_running = True
+        cg.set_event_sink(sync_sink)
+        try:
+            await broadcast({"type": "job_start"})
+            client = await get_client()
+            origem = await client.get_entity(body.origem_privada_id)
+            destino = await client.get_entity(body.destino_id)
+            destino = await cg.ensure_forum_enabled(client, destino)
+            await cg.copiar_privado_para_topico(
+                client,
+                origem,
+                destino,
+                int(body.destino_topic_id),
+                modo_mensagens=body.filtro,
+                incremental=(body.mode == "incremental"),
+                sync_data=cg.load_sync(),
+            )
+            await broadcast({"type": "job_done"})
+        except Exception as exc:
+            await broadcast({"type": "job_error", "message": str(exc)})
+            cg.say(f"❌ Erro ao copiar privado: {exc}")
         finally:
             state.job_running = False
             cg.set_event_sink(None)

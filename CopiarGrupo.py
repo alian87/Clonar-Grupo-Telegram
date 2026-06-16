@@ -331,6 +331,31 @@ async def coletar_grupos(client):
     return grupos
 
 
+async def coletar_chats_privados(client):
+    """Lista chats privados (usuários) da conta."""
+    chats = []
+    async for dialog in client.iter_dialogs():
+        if not dialog.is_user:
+            continue
+        entity = dialog.entity
+        if isinstance(entity, types.User) and getattr(entity, "is_self", False):
+            continue
+        peer_id = utils.get_peer_id(entity)
+        nome = dialog.name or "Sem nome"
+        username = getattr(entity, "username", None)
+        chats.append(
+            {
+                "peer_id": peer_id,
+                "nome": nome,
+                "username": username,
+                "tipo": "Privado",
+                "entity": entity,
+            }
+        )
+    chats.sort(key=lambda item: item["nome"].casefold())
+    return chats
+
+
 def exibir_grupos(grupos):
     if not grupos:
         say("\nNenhum grupo encontrado na sua conta.")
@@ -406,7 +431,13 @@ async def ensure_forum_enabled(client, entity):
     if await is_forum(client, entity):
         return entity
     say("⚙️ Ativando tópicos no grupo de destino…")
-    await client(functions.channels.ToggleForumRequest(channel=entity, enabled=True))
+    await client(
+        functions.channels.ToggleForumRequest(
+            channel=entity,
+            enabled=True,
+            tabs=False,
+        )
+    )
     return await client.get_entity(entity)
 
 
@@ -949,6 +980,106 @@ async def copiar_grupo_simples(
     if total == 0 and incremental:
         say("Nenhuma mensagem nova.")
     say(f"✅ Encaminhamento concluído. Total: {total}\n")
+
+
+async def copiar_privado_para_topico(
+    client,
+    from_entity,
+    to_entity,
+    dest_topic_id: int,
+    modo_mensagens: str = "received",
+    incremental: bool = False,
+    sync_data=None,
+):
+    """
+    Clona mensagens de um chat privado para um tópico específico do destino.
+    modo_mensagens: "received" (somente recebidas) ou "all" (todas).
+    """
+    if modo_mensagens not in {"received", "all"}:
+        raise ValueError("modo_mensagens inválido. Use 'received' ou 'all'.")
+
+    sync_data = sync_data if sync_data is not None else load_sync()
+    pair_key = f"{sync_pair_key(from_entity, to_entity)}:{int(dest_topic_id)}"
+    source_name = getattr(from_entity, "first_name", None) or getattr(
+        from_entity, "title", "Privado"
+    )
+    mode_label = "somente recebidas" if modo_mensagens == "received" else "todas"
+    say(f"💬 Origem privada: {source_name!r} | filtro: {mode_label}")
+
+    min_id = (
+        obter_ultimo_id_topico(sync_data, pair_key, 0, "privado_to_topic")
+        if incremental
+        else 0
+    )
+    if incremental and min_id:
+        say(f"Última mensagem copiada: id {min_id}")
+        say("🔄 Modo incremental: copiando apenas mensagens novas.")
+    elif incremental and min_id == 0 and await destino_topico_tem_conteudo(
+        client, to_entity, dest_topic_id
+    ):
+        say("⚠️ Tópico destino já tem mensagens sem histórico de sync. Pulando para evitar duplicatas.")
+        return
+
+    total = 0
+    max_copied_id = min_id
+    ids_buffer = []
+
+    async def enviar_buffer():
+        nonlocal total, max_copied_id, ids_buffer
+        if not ids_buffer:
+            return
+        lote = ids_buffer[:]
+        await encaminhar_com_retry(client, from_entity, to_entity, lote, dest_topic_id)
+        total += len(lote)
+        max_copied_id = max(max_copied_id, max(lote))
+        say(f"  {total} mensagens encaminhadas…")
+        ids_buffer.clear()
+        await asyncio.sleep(SLEEP_BETWEEN)
+
+    async for msg in client.iter_messages(from_entity, reverse=True):
+        if isinstance(msg, types.MessageService):
+            continue
+        if msg.id <= min_id:
+            continue
+        if modo_mensagens == "received" and getattr(msg, "out", False):
+            continue
+        ids_buffer.append(msg.id)
+        if len(ids_buffer) >= BATCH_SIZE:
+            try:
+                await enviar_buffer()
+            except Exception as e:
+                say(f"  Erro em lote -> {e}")
+                for mid in ids_buffer[:]:
+                    try:
+                        await encaminhar_com_retry(
+                            client, from_entity, to_entity, [mid], dest_topic_id
+                        )
+                        total += 1
+                        max_copied_id = max(max_copied_id, mid)
+                    except Exception as e2:
+                        say(f"  Erro id {mid} -> {e2}")
+                ids_buffer.clear()
+
+    if ids_buffer:
+        try:
+            await enviar_buffer()
+        except Exception as e:
+            say(f"  Erro no envio final -> {e}")
+            for mid in ids_buffer[:]:
+                try:
+                    await encaminhar_com_retry(
+                        client, from_entity, to_entity, [mid], dest_topic_id
+                    )
+                    total += 1
+                    max_copied_id = max(max_copied_id, mid)
+                except Exception as e2:
+                    say(f"  Erro id {mid} -> {e2}")
+
+    registrar_topico_sync(sync_data, pair_key, 0, "privado_to_topic", max_copied_id)
+    save_sync(sync_data)
+    if total == 0 and incremental:
+        say("Nenhuma mensagem nova.")
+    say(f"✅ Encaminhamento privado concluído. Total: {total}\n")
 
 
 async def copiar_origem(client, from_entity, to_entity, mode="full", skip_confirm_rebuild=False):
